@@ -1,0 +1,43 @@
+# ─── Default: normalise all text files to LF on commit ──────────────────────
+* text=auto eol=lf
+
+# ─── Rust / Cargo ────────────────────────────────────────────────────────────
+*.rs      text eol=lf
+*.toml    text eol=lf
+*.lock    text eol=lf  -diff   # keep LF; suppress noisy diffs in `git log -p`
+Cargo.lock text eol=lf -diff merge=binary
+
+# ─── Shell / batch: keep native line endings ─────────────────────────────────
+*.sh      text eol=lf
+*.bash    text eol=lf
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.ps1     text eol=crlf        # PowerShell scripts need CRLF on Win11
+
+# ─── Markdown / docs ─────────────────────────────────────────────────────────
+*.md      text eol=lf
+*.txt     text eol=lf
+
+# ─── Config / data formats ───────────────────────────────────────────────────
+*.json    text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.xml     text eol=lf
+
+# ─── True binary files — never touch line endings or diff as text ────────────
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.ico     binary
+*.webp    binary
+*.pdf     binary
+*.zip     binary
+*.gz      binary
+*.tar     binary
+*.7z      binary
+*.exe     binary
+*.dll     binary
+*.pdb     binary
+*.rlib    binary
+*.rmeta   binary

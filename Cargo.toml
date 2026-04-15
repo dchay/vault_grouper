@@ -1,0 +1,30 @@
+[package]
+name    = "obsidian_vault_grouper"
+version = "0.1.9"
+edition = "2024"
+
+[lib]
+name = "obsidian_vault_grouper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "obsidian_vault_grouper"
+path = "src/main.rs"
+
+[dependencies]
+anyhow       = "1"
+clap         = { version = "4.5", features = ["derive"] }
+globset      = "0.4"
+indicatif    = "0.17"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+sha2         = "0.10"
+tempfile     = "3"
+time         = { version = "0.3", features = ["formatting", "macros"] }
+walkdir      = "2"
+
+[dev-dependencies]
+proptest     = "1"
+tempfile     = "3"
+rand         = "0.8"
+rand_chacha  = "0.3"
