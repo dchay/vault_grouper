@@ -478,6 +478,10 @@ pub fn write_group(
     }
 
     w.flush()?;
+
+    // Explicitly drop the writer so the borrow on `tmp` ends
+    drop(w);
+    
     tmp.persist(&final_path)
         .with_context(|| format!("Cannot persist to {}", final_path.display()))?;
     let bytes_written = fs::metadata(&final_path)?.len();
