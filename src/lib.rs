@@ -288,53 +288,62 @@ pub fn discover_md_files(
     (results, warnings)
 }
 
-/// New core logic: Pack by folder first, but split folder if it exceeds max_bytes[cite: 2].
+/// Rewritten core logic: Recursive "Deep Pack" consolidation.
+/// This bubbles up files from the deepest subdirectories and groups them
+/// with parents until the size limit is hit.
 pub fn pack_into_groups(md_files: &[MdFile], cfg: &VaultConfig) -> (Vec<GroupPlan>, Vec<String>) {
-    let mut groups = Vec::new();
-    let mut warnings = Vec::new();
-    let mut folder_map: HashMap<PathBuf, Vec<MdFile>> = HashMap::new();
+    // Explicitly type the Vec to resolve E0282
+    let mut final_groups: Vec<GroupPlan> = Vec::new();
+    let warnings: Vec<String> = Vec::new();
 
-    // Group files by parent directory[cite: 2]
+    // 1. Build the tree-like structure
+    let mut tree: HashMap<PathBuf, Vec<MdFile>> = HashMap::new();
+    let mut folders: Vec<PathBuf> = Vec::new();
+
     for md in md_files {
         let parent = md.rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
-        folder_map.entry(parent).or_default().push(md.clone());
+        if !tree.contains_key(&parent) {
+            folders.push(parent.clone());
+        }
+        tree.entry(parent).or_default().push(md.clone());
     }
 
-    let mut keys: Vec<_> = folder_map.keys().collect();
-    keys.sort();
+    // Sort folders by depth (longest paths first)[cite: 2]
+    folders.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
 
-    for key in keys {
-        let files = &folder_map[key];
-        let mut current_group = GroupPlan::new(groups.len() + 1);
+    let mut current_pack = GroupPlan::new(1);
 
-        for md in files {
-            // Check if file is individually too large[cite: 2]
-            if md.size >= cfg.max_bytes {
-                if !current_group.files.is_empty() {
-                    groups.push(current_group);
-                    current_group = GroupPlan::new(groups.len() + 1);
+    // 2. Process folders from the leaves up to the root[cite: 2]
+    for folder in folders {
+        if let Some(files) = tree.get(&folder) {
+            for md in files {
+                // If a single file is a behemoth, isolate it[cite: 2]
+                if md.size >= cfg.max_bytes {
+                    if !current_pack.files.is_empty() {
+                        final_groups.push(current_pack);
+                        current_pack = GroupPlan::new(final_groups.len() + 1);
+                    }
+                    current_pack.add(md.clone(), cfg, true);
+                    final_groups.push(current_pack);
+                    current_pack = GroupPlan::new(final_groups.len() + 1);
+                    continue;
                 }
-                current_group.add(md.clone(), cfg, true);
-                groups.push(current_group);
-                current_group = GroupPlan::new(groups.len() + 1);
-                continue;
-            }
 
-            // If it doesn't fit in current group (oversized folder split), start new group[cite: 2]
-            if !current_group.can_fit(md, cfg) {
-                if !current_group.files.is_empty() {
-                    groups.push(current_group);
-                    current_group = GroupPlan::new(groups.len() + 1);
+                // Consolidation check[cite: 2]
+                if !current_pack.can_fit(md, cfg) {
+                    final_groups.push(current_pack);
+                    current_pack = GroupPlan::new(final_groups.len() + 1);
                 }
+                current_pack.add(md.clone(), cfg, current_pack.files.is_empty());
             }
-            current_group.add(md.clone(), cfg, current_group.files.is_empty());
-        }
-
-        if !current_group.files.is_empty() {
-            groups.push(current_group);
         }
     }
-    (groups, warnings)
+
+    if !current_pack.files.is_empty() {
+        final_groups.push(current_pack);
+    }
+
+    (final_groups, warnings)
 }
 
 pub fn write_group(
