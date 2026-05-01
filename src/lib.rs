@@ -1,28 +1,32 @@
-//! obsidian_vault_grouper v1.6.3
-//! The Sentinel Edition: Cross-Platform Safety, Atomic Replacement, and CI/CD Optimization.
+//! obsidian_vault_grouper v1.6.4
+//! The Paladin Edition: Windows 11 Optimization, Atomic Persistence, and CI/CD Mastery.
 
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{BufWriter, Write, Read, BufReader},
+    io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    sync::{atomic::{AtomicUsize, Ordering}, Arc},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
+use chrono::Local;
 use clap::{Parser, Subcommand, ValueEnum};
-use walkdir::WalkDir;
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
-use serde::{Serialize, Deserialize};
-use sha2::{Sha256, Digest};
-use tempfile::NamedTempFile;
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
+use walkdir::WalkDir;
+// For unique backups
+use dunce;
+// Windows-friendly path handling
 
 // --- Brain: Constants & Logic ---
 const YAML_BASE: u64 = 64;
 const TOC_HEAD: u64 = 40;
-const CHAPTER_OVERHEAD_BASE: u64 = 25;
+const PER_FILE_OVERHEAD: u64 = 25; // Replaces CHAPTER_OVERHEAD_BASE
 const SAFETY_MARGIN: u64 = 16 * 1024;
 const BUFFER_SIZE: usize = 8192;
 const MAX_RECURSION_DEPTH: u32 = 500;
@@ -31,7 +35,7 @@ const MAX_RECURSION_DEPTH: u32 = 500;
 pub enum SortBy { Name, Mtime }
 
 #[derive(Parser)]
-#[command(name = "grouper", version = "1.6.3", about = "Enterprise-grade Obsidian vault grouping.")]
+#[command(name = "grouper", version = "1.6.4", about = "Enterprise-grade Obsidian vault grouping.")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -61,6 +65,8 @@ pub enum Commands {
         dry_run: bool,
         #[arg(long)]
         quiet: bool,
+        #[arg(long)]
+        no_progress: bool,
     },
     /// Verify the integrity of existing packs
     Verify {
@@ -84,6 +90,7 @@ pub struct BrainState {
     pub subfolders: HashMap<PathBuf, HashSet<PathBuf>>,
 }
 
+#[derive(Debug)]
 pub struct GroupPlan {
     pub files: Vec<Arc<MdFile>>,
     pub est_size: u64,
@@ -95,7 +102,7 @@ pub struct Manifest {
     pub packs: HashMap<String, PackInfo>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct PackInfo {
     pub checksum: String,
     pub files: Vec<String>,
@@ -112,12 +119,11 @@ fn build_globset(patterns: &[String]) -> Result<GlobSet> {
 pub fn scan_vault(root: &Path, out: &Path, excludes: &GlobSet) -> Result<BrainState> {
     let mut files_by_folder = HashMap::new();
     let mut subfolders = HashMap::new();
-    let root_canonical = root.canonicalize().context("Failed to resolve vault root path")?;
-    let out_canonical = out.canonicalize().ok();
+    let root_canonical = dunce::canonicalize(root).context("Failed to resolve vault root path")?;
+    let out_canonical = dunce::canonicalize(out).ok();
 
     subfolders.insert(PathBuf::from(""), HashSet::new());
 
-    // Deterministic traversal: walkdir sorts entries within directories
     let walker = WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name();
@@ -130,7 +136,7 @@ pub fn scan_vault(root: &Path, out: &Path, excludes: &GlobSet) -> Result<BrainSt
         }
 
         if path.extension().map_or(false, |ext| ext == "md") && entry.file_type().is_file() {
-            let rel = path.strip_prefix(&root_canonical)?;
+            let rel = path.strip_prefix(&root_canonical).unwrap_or(path);
             let rel_unix = rel.to_string_lossy().replace('\\', "/");
 
             if excludes.is_match(&rel_unix) { continue; }
@@ -165,7 +171,7 @@ fn pack_node(
     sort_by: SortBy,
     depth: u32,
 ) -> Result<(Vec<GroupPlan>, Vec<Arc<MdFile>>)> {
-    if depth > MAX_RECURSION_DEPTH { bail!("Recursion safety limit reached (500). Check for circular symlinks."); }
+    if depth > MAX_RECURSION_DEPTH { bail!("Recursion safety limit reached (500)."); }
 
     let mut completed_packs = Vec::new();
     let mut current_pool = Vec::new();
@@ -193,7 +199,7 @@ fn pack_node(
     let mut current_pack = GroupPlan { files: Vec::new(), est_size: YAML_BASE + TOC_HEAD };
 
     for f in current_pool {
-        let overhead = CHAPTER_OVERHEAD_BASE + (f.rel_unix.len() as u64 * 2);
+        let overhead = PER_FILE_OVERHEAD + (f.rel_unix.len() as u64 * 2);
         let total_f_size = f.size + overhead;
 
         if total_f_size + YAML_BASE + TOC_HEAD > available_bytes + SAFETY_MARGIN {
@@ -219,27 +225,32 @@ fn pack_node(
     Ok((completed_packs, remainder))
 }
 
-// --- Mass: Execution & System Safety ---
+// --- Mass: Presentation & Safety ---
 
 fn is_system_dir(path: &Path) -> bool {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let p = canonical.to_string_lossy().to_lowercase();
 
-    // Unix & Windows System Roots
-    p == "/" || p == "c:\\" || p.starts_with("/etc") || p.starts_with("/dev") ||
-        p.starts_with("/bin") || p.starts_with("/sbin") || p.starts_with("/usr") ||
-        p.starts_with("c:\\windows") || p.starts_with("c:\\program files")
+    let restricted = [
+        "/", "/etc", "/dev", "/bin", "/sbin", "/usr", "/boot",
+        "c:\\", "c:\\windows", "c:\\program files", "c:\\program files (x86)",
+        "d:\\", "e:\\", "f:\\"
+    ];
+
+    restricted.iter().any(|&r| p == r || p.starts_with(&(r.to_owned() + "\\")) || p.starts_with(&(r.to_owned() + "/")))
 }
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Pack { vault_root, output_dir, max_mb, max_chapters, sort_by, exclude, resume, force, manifest, dry_run, quiet } => {
+        Commands::Pack { vault_root, output_dir, max_mb, max_chapters, sort_by, exclude, resume, force, manifest, dry_run, quiet, no_progress } => {
             let out = output_dir.unwrap_or_else(|| vault_root.join("_grouped"));
 
-            if out.as_os_str().is_empty() { bail!("Output directory path cannot be empty."); }
-            if is_system_dir(&out) { bail!("Safety Guard: Refusing to write to system directory: {}", out.display()); }
+            if out.as_os_str().is_empty() || out == Path::new(".") || out == Path::new("..") {
+                bail!("Invalid output directory path.");
+            }
+            if is_system_dir(&out) { bail!("Refusing to write to protected system directory: {}", out.display()); }
             if !dry_run { fs::create_dir_all(&out)?; }
 
             let excludes_set = build_globset(&exclude)?;
@@ -250,28 +261,29 @@ pub fn run() -> Result<()> {
 
             let (mut packs, last) = pack_node(Path::new(""), &state, available, max_chapters, sort_by, 0)?;
             if !last.is_empty() {
-                packs.push(GroupPlan { files: last, est_size: 0 }); // Size doesn't matter for final group
+                let actual_size = last.iter().map(|f| f.size + PER_FILE_OVERHEAD + (f.rel_unix.len() as u64 * 2)).sum::<u64>() + YAML_BASE + TOC_HEAD;
+                packs.push(GroupPlan { files: last, est_size: actual_size });
             }
 
             if packs.is_empty() {
-                if !quiet { println!("No markdown files found to process."); }
+                if !quiet { println!("No files found to process."); }
                 return Ok(());
             }
 
             if dry_run {
-                println!("Dry Run: {} packs planned.", packs.len());
+                println!("Dry Run: {} packs planned containing {} files.", packs.len(), packs.iter().map(|p| p.files.len()).sum::<usize>());
                 return Ok(());
             }
 
+            let show_progress = !quiet && !no_progress && atty::is(atty::Stream::Stdout);
             let mut pack_pb = None;
-            if !quiet {
-                let mp = MultiProgress::new();
-                let pb = mp.add(ProgressBar::new(packs.len() as u64));
+            if show_progress {
+                let pb = ProgressBar::new(packs.len() as u64);
                 pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")?);
                 pack_pb = Some(pb);
             }
 
-            let mut manifest_data = Manifest { version: "1.6.3".into(), packs: HashMap::new() };
+            let mut manifest_data = Manifest { version: "1.6.4".into(), packs: HashMap::new() };
 
             for (i, p) in packs.iter().enumerate() {
                 let pack_name = format!("pack_{:04}.md", i + 1);
@@ -281,8 +293,7 @@ pub fn run() -> Result<()> {
                     if let Some(ref pb) = pack_pb { pb.inc(1); }
                     continue;
                 }
-
-                if dest.is_dir() { bail!("Path conflict: {} is a directory.", dest.display()); }
+                if dest.is_dir() { bail!("Cannot overwrite directory: {}", dest.display()); }
 
                 let tmp = NamedTempFile::new_in(&out)?;
                 let mut hasher = Sha256::new();
@@ -313,7 +324,7 @@ pub fn run() -> Result<()> {
                         while let Ok(n) = src.read(&mut buf) {
                             if n == 0 { break; }
                             if written + (n as u64) > capacity + SAFETY_MARGIN {
-                                bail!("Limit Exceeded: Pack {} exceeds defined max_mb limit.", pack_name);
+                                bail!("Size Limit Exceeded: Pack {} exceeds user-defined max_mb.", pack_name);
                             }
                             writer.write_all(&buf[..n])?;
                             hasher.update(&buf[..n]);
@@ -327,17 +338,19 @@ pub fn run() -> Result<()> {
                     files: p.files.iter().map(|f| f.rel_unix.clone()).collect(),
                 });
 
-                // Atomic-Backup Replace Strategy
+                // Atomic Swap with Collision-Proof Backups
                 if dest.exists() {
-                    let backup = dest.with_extension("bak");
-                    fs::rename(&dest, &backup)?;
+                    let ts = Local::now().format("%Y%m%d_%H%M%S");
+                    let backup = dest.with_extension(format!("bak_{}", ts));
+                    fs::rename(&dest, &backup).context("Failed to create backup")?;
+
                     if let Err(e) = tmp.persist(&dest) {
-                        fs::rename(&backup, &dest)?; // Restore original on failure
+                        fs::rename(&backup, &dest).ok(); // Attempt restore
                         return Err(e.into());
                     }
-                    fs::remove_file(backup)?;
+                    fs::remove_file(backup).ok(); // Cleanup backup
                 } else {
-                    tmp.persist(&dest).context("Failed to persist pack file")?;
+                    tmp.persist(&dest).context("Failed to persist pack")?;
                 }
 
                 if let Some(ref pb) = pack_pb { pb.inc(1); }
@@ -346,6 +359,7 @@ pub fn run() -> Result<()> {
             if manifest {
                 fs::write(out.join("manifest.json"), serde_json::to_string_pretty(&manifest_data)?)?;
             }
+            if let Some(pb) = pack_pb { pb.finish_with_message("Done"); }
         }
         Commands::Verify { manifest_path, quiet } => {
             let data = fs::read_to_string(&manifest_path).context("Manifest not found")?;
@@ -357,14 +371,14 @@ pub fn run() -> Result<()> {
                 let p_path = base.join(name);
                 let res: Result<()> = (|| {
                     let mut hasher = Sha256::new();
-                    let mut f = File::open(&p_path).with_context(|| format!("Missing or unreadable: {}", name))?;
+                    let mut f = File::open(&p_path).with_context(|| format!("Unreadable pack: {}", name))?;
                     let mut buf = [0u8; BUFFER_SIZE];
                     while let Ok(n) = f.read(&mut buf) {
                         if n == 0 { break; }
                         hasher.update(&buf[..n]);
                     }
                     if format!("{:x}", hasher.finalize()) != info.checksum {
-                        bail!("Checksum mismatch in {}", name);
+                        bail!("Checksum mismatch: {}", name);
                     }
                     Ok(())
                 })();
@@ -372,14 +386,14 @@ pub fn run() -> Result<()> {
                 match res {
                     Ok(_) => if !quiet { println!("[OK] {}", name); },
                     Err(e) => {
-                        eprintln!("[FAIL] {}", e);
-                        errors.fetch_add(1, Ordering::SeqCst);
+                        if !quiet { eprintln!("[FAIL] {}", e); }
+                        errors.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             });
 
-            let err_count = errors.load(Ordering::SeqCst);
-            if err_count > 0 { bail!("Verification Failed: {} corrupted or missing packs.", err_count); }
+            let count = errors.load(Ordering::Relaxed);
+            if count > 0 { bail!("Verification Failed: {} packs are invalid.", count); }
             else if !quiet { println!("All packs verified successfully."); }
         }
     }
