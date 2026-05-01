@@ -1,8 +1,8 @@
-use obsidian_vault_grouper::run_cli;
+use obsidian_vault_grouper::{run};
 
 fn main() {
-    if let Err(e) = run_cli() {
-        eprintln!("[ERROR] {e:#}");
+    if let Err(e) = run() {
+        eprintln!("Error: {:?}", e);
         std::process::exit(1);
     }
 }
