@@ -1,5 +1,5 @@
-//! obsidian_vault_grouper v1.6.2
-//! The Guardian Edition: Atomic Writes, Efficient Scans, and System Safety.
+//! obsidian_vault_grouper v1.6.3
+//! The Sentinel Edition: Cross-Platform Safety, Atomic Replacement, and CI/CD Optimization.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,19 +19,19 @@ use sha2::{Sha256, Digest};
 use tempfile::NamedTempFile;
 use rayon::prelude::*;
 
-// --- Brain: Constants & Calculus ---
+// --- Brain: Constants & Logic ---
 const YAML_BASE: u64 = 64;
 const TOC_HEAD: u64 = 40;
 const CHAPTER_OVERHEAD_BASE: u64 = 25;
-const SAFETY_MARGIN: u64 = 16 * 1024; // 16KB symmetric margin
-const BUFFER_SIZE: usize = 8192;      // Standard 8KB buffer
+const SAFETY_MARGIN: u64 = 16 * 1024;
+const BUFFER_SIZE: usize = 8192;
 const MAX_RECURSION_DEPTH: u32 = 500;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum SortBy { Name, Mtime }
 
 #[derive(Parser)]
-#[command(name = "grouper", version = "1.6.2", about = "Enterprise-grade Obsidian vault grouping.")]
+#[command(name = "grouper", version = "1.6.3", about = "Enterprise-grade Obsidian vault grouping.")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -66,6 +66,8 @@ pub enum Commands {
     Verify {
         #[arg(default_value = "_grouped/manifest.json")]
         manifest_path: PathBuf,
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -110,12 +112,12 @@ fn build_globset(patterns: &[String]) -> Result<GlobSet> {
 pub fn scan_vault(root: &Path, out: &Path, excludes: &GlobSet) -> Result<BrainState> {
     let mut files_by_folder = HashMap::new();
     let mut subfolders = HashMap::new();
-    let root_canonical = root.canonicalize().context("Failed to canonicalize vault root")?;
+    let root_canonical = root.canonicalize().context("Failed to resolve vault root path")?;
     let out_canonical = out.canonicalize().ok();
 
     subfolders.insert(PathBuf::from(""), HashSet::new());
 
-    // Per-directory sorting for memory-efficient determinism
+    // Deterministic traversal: walkdir sorts entries within directories
     let walker = WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name();
@@ -163,7 +165,7 @@ fn pack_node(
     sort_by: SortBy,
     depth: u32,
 ) -> Result<(Vec<GroupPlan>, Vec<Arc<MdFile>>)> {
-    if depth > MAX_RECURSION_DEPTH { bail!("Vault depth exceeds safety limit (500)."); }
+    if depth > MAX_RECURSION_DEPTH { bail!("Recursion safety limit reached (500). Check for circular symlinks."); }
 
     let mut completed_packs = Vec::new();
     let mut current_pool = Vec::new();
@@ -194,7 +196,6 @@ fn pack_node(
         let overhead = CHAPTER_OVERHEAD_BASE + (f.rel_unix.len() as u64 * 2);
         let total_f_size = f.size + overhead;
 
-        // Behemoth Check (against absolute capacity)
         if total_f_size + YAML_BASE + TOC_HEAD > available_bytes + SAFETY_MARGIN {
             completed_packs.push(GroupPlan { files: vec![f.clone()], est_size: total_f_size + YAML_BASE + TOC_HEAD });
             continue;
@@ -218,11 +219,16 @@ fn pack_node(
     Ok((completed_packs, remainder))
 }
 
-// --- Mass: Execution & Presentation ---
+// --- Mass: Execution & System Safety ---
 
 fn is_system_dir(path: &Path) -> bool {
-    let p = path.to_string_lossy();
-    p == "/" || p == "/etc" || p == "/dev" || p == "/bin" || p == "/sbin" || p == "/usr"
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let p = canonical.to_string_lossy().to_lowercase();
+
+    // Unix & Windows System Roots
+    p == "/" || p == "c:\\" || p.starts_with("/etc") || p.starts_with("/dev") ||
+        p.starts_with("/bin") || p.starts_with("/sbin") || p.starts_with("/usr") ||
+        p.starts_with("c:\\windows") || p.starts_with("c:\\program files")
 }
 
 pub fn run() -> Result<()> {
@@ -231,7 +237,9 @@ pub fn run() -> Result<()> {
     match cli.command {
         Commands::Pack { vault_root, output_dir, max_mb, max_chapters, sort_by, exclude, resume, force, manifest, dry_run, quiet } => {
             let out = output_dir.unwrap_or_else(|| vault_root.join("_grouped"));
-            if is_system_dir(&out) { bail!("Refusing to write to system directory: {}", out.display()); }
+
+            if out.as_os_str().is_empty() { bail!("Output directory path cannot be empty."); }
+            if is_system_dir(&out) { bail!("Safety Guard: Refusing to write to system directory: {}", out.display()); }
             if !dry_run { fs::create_dir_all(&out)?; }
 
             let excludes_set = build_globset(&exclude)?;
@@ -242,28 +250,28 @@ pub fn run() -> Result<()> {
 
             let (mut packs, last) = pack_node(Path::new(""), &state, available, max_chapters, sort_by, 0)?;
             if !last.is_empty() {
-                let actual_size = last.iter().map(|f| f.size + CHAPTER_OVERHEAD_BASE + (f.rel_unix.len() as u64 * 2)).sum::<u64>() + YAML_BASE + TOC_HEAD;
-                packs.push(GroupPlan { files: last, est_size: actual_size });
+                packs.push(GroupPlan { files: last, est_size: 0 }); // Size doesn't matter for final group
             }
 
             if packs.is_empty() {
-                println!("No markdown files were processed (check your excludes).");
+                if !quiet { println!("No markdown files found to process."); }
                 return Ok(());
             }
 
             if dry_run {
-                println!("Dry Run Summary:\n- Packs: {}\n- Total Files: {}", packs.len(), packs.iter().map(|p| p.files.len()).sum::<usize>());
+                println!("Dry Run: {} packs planned.", packs.len());
                 return Ok(());
             }
 
-            let mp = MultiProgress::new();
-            let pack_pb = if !quiet {
+            let mut pack_pb = None;
+            if !quiet {
+                let mp = MultiProgress::new();
                 let pb = mp.add(ProgressBar::new(packs.len() as u64));
                 pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")?);
-                Some(pb)
-            } else { None };
+                pack_pb = Some(pb);
+            }
 
-            let mut manifest_data = Manifest { version: "1.6.2".into(), packs: HashMap::new() };
+            let mut manifest_data = Manifest { version: "1.6.3".into(), packs: HashMap::new() };
 
             for (i, p) in packs.iter().enumerate() {
                 let pack_name = format!("pack_{:04}.md", i + 1);
@@ -274,7 +282,8 @@ pub fn run() -> Result<()> {
                     continue;
                 }
 
-                // Write to temp first (Atomic Replace)
+                if dest.is_dir() { bail!("Path conflict: {} is a directory.", dest.display()); }
+
                 let tmp = NamedTempFile::new_in(&out)?;
                 let mut hasher = Sha256::new();
                 let mut written: u64 = 0;
@@ -304,7 +313,7 @@ pub fn run() -> Result<()> {
                         while let Ok(n) = src.read(&mut buf) {
                             if n == 0 { break; }
                             if written + (n as u64) > capacity + SAFETY_MARGIN {
-                                bail!("Critical Overflow: Pack {} exceeds hardware capacity.", pack_name);
+                                bail!("Limit Exceeded: Pack {} exceeds defined max_mb limit.", pack_name);
                             }
                             writer.write_all(&buf[..n])?;
                             hasher.update(&buf[..n]);
@@ -318,9 +327,19 @@ pub fn run() -> Result<()> {
                     files: p.files.iter().map(|f| f.rel_unix.clone()).collect(),
                 });
 
-                // On Windows, persist fails if target exists, so we handle swap
-                if dest.exists() { fs::remove_file(&dest)?; }
-                tmp.persist(&dest).context("Failed to commit pack to disk")?;
+                // Atomic-Backup Replace Strategy
+                if dest.exists() {
+                    let backup = dest.with_extension("bak");
+                    fs::rename(&dest, &backup)?;
+                    if let Err(e) = tmp.persist(&dest) {
+                        fs::rename(&backup, &dest)?; // Restore original on failure
+                        return Err(e.into());
+                    }
+                    fs::remove_file(backup)?;
+                } else {
+                    tmp.persist(&dest).context("Failed to persist pack file")?;
+                }
+
                 if let Some(ref pb) = pack_pb { pb.inc(1); }
             }
 
@@ -328,7 +347,7 @@ pub fn run() -> Result<()> {
                 fs::write(out.join("manifest.json"), serde_json::to_string_pretty(&manifest_data)?)?;
             }
         }
-        Commands::Verify { manifest_path } => {
+        Commands::Verify { manifest_path, quiet } => {
             let data = fs::read_to_string(&manifest_path).context("Manifest not found")?;
             let manifest: Manifest = serde_json::from_str(&data)?;
             let base = manifest_path.parent().unwrap_or_else(|| Path::new("."));
@@ -336,22 +355,22 @@ pub fn run() -> Result<()> {
 
             manifest.packs.par_iter().for_each(|(name, info)| {
                 let p_path = base.join(name);
-                let result: Result<()> = (|| {
+                let res: Result<()> = (|| {
                     let mut hasher = Sha256::new();
-                    let mut f = File::open(&p_path).with_context(|| format!("Cannot open {}", name))?;
+                    let mut f = File::open(&p_path).with_context(|| format!("Missing or unreadable: {}", name))?;
                     let mut buf = [0u8; BUFFER_SIZE];
                     while let Ok(n) = f.read(&mut buf) {
                         if n == 0 { break; }
                         hasher.update(&buf[..n]);
                     }
                     if format!("{:x}", hasher.finalize()) != info.checksum {
-                        bail!("Checksum mismatch for {}", name);
+                        bail!("Checksum mismatch in {}", name);
                     }
                     Ok(())
                 })();
 
-                match result {
-                    Ok(_) => println!("[OK] {}", name),
+                match res {
+                    Ok(_) => if !quiet { println!("[OK] {}", name); },
                     Err(e) => {
                         eprintln!("[FAIL] {}", e);
                         errors.fetch_add(1, Ordering::SeqCst);
@@ -360,8 +379,8 @@ pub fn run() -> Result<()> {
             });
 
             let err_count = errors.load(Ordering::SeqCst);
-            if err_count > 0 { bail!("Verification failed: {} packs corrupted or missing.", err_count); }
-            else { println!("All packs verified successfully."); }
+            if err_count > 0 { bail!("Verification Failed: {} corrupted or missing packs.", err_count); }
+            else if !quiet { println!("All packs verified successfully."); }
         }
     }
     Ok(())
