@@ -5,8 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
     io::{BufWriter, Write, Read, BufReader},
-    path::{Path, PathBuf},
-    sync::Arc,
+    path::{Path, PathBuf}
 };
 
 use anyhow::{Context, Result, bail};
