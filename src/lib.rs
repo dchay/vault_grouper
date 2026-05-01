@@ -1,5 +1,5 @@
-//! obsidian_vault_grouper v1.1.0
-//! Production-grade FLECS/Apparatus/Mass hybrid architecture.
+//! obsidian_vault_grouper v1.2.0
+//! Fully debugged FLECS/Apparatus/Mass architecture.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -16,7 +16,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 use tempfile::NamedTempFile;
 
-// --- FLECS: The Brain (Single Source of Truth) ---
+// --- FLECS: The Brain (State Models) ---
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum SortBy { Name, Mtime }
@@ -38,6 +38,8 @@ pub struct Cli {
     pub resume: bool,
     #[arg(long)]
     pub manifest: bool,
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -62,18 +64,17 @@ pub struct GroupPlan {
 #[derive(Serialize)]
 pub struct Manifest {
     pub generated_at: u64,
-    pub total_groups: usize,
-    pub total_files: usize,
+    pub config: String,
+    pub group_map: HashMap<String, Vec<PathBuf>>,
 }
 
-// --- Apparatus: The Nervous System (Sensory Input/Discovery) ---
+// --- Apparatus: Sensory Discovery ---
 
 pub fn build_tree(root: &Path, output_dir: &Path, exclude: &GlobSet) -> Result<VaultTree> {
-    // Explicit type annotations to resolve E0282
     let mut files_by_folder: HashMap<PathBuf, Vec<MdFile>> = HashMap::new();
     let mut subfolders: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
 
-    // Fix: Ensure root "" is present to trigger recursive traversal
+    // Initialize root node
     subfolders.insert(PathBuf::from(""), HashSet::new());
 
     let abs_root = root.canonicalize().context("Invalid vault root")?;
@@ -82,16 +83,11 @@ pub fn build_tree(root: &Path, output_dir: &Path, exclude: &GlobSet) -> Result<V
     for entry in walkdir::WalkDir::new(&abs_root).min_depth(1).follow_links(false) {
         let e = match entry {
             Ok(val) => val,
-            Err(err) => {
-                eprintln!("Warning: Skipping unreadable entry: {}", err);
-                continue;
-            }
+            Err(err) => { eprintln!("Warning: Skipping entry: {}", err); continue; }
         };
 
         let path = e.path();
-        if let Some(ref out) = abs_output {
-            if path.starts_with(out) { continue; }
-        }
+        if let Some(ref out) = abs_output { if path.starts_with(out) { continue; } }
 
         let rel = path.strip_prefix(&abs_root).unwrap_or(path).to_path_buf();
         if exclude.is_match(&rel) { continue; }
@@ -99,11 +95,11 @@ pub fn build_tree(root: &Path, output_dir: &Path, exclude: &GlobSet) -> Result<V
         if path.extension().map_or(false, |ext| ext == "md") && e.file_type().is_file() {
             let parent = rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
 
-            // Build DAG hierarchy
-            let mut curr = rel.as_path();
-            while let Some(p) = curr.parent() {
-                subfolders.entry(p.to_path_buf()).or_default().insert(curr.to_path_buf());
-                curr = p;
+            // FIX: Ensure only folders enter the subfolders map
+            let mut curr_dir = parent.as_path();
+            while let Some(p) = curr_dir.parent() {
+                subfolders.entry(p.to_path_buf()).or_default().insert(curr_dir.to_path_buf());
+                curr_dir = p;
             }
 
             let meta = e.metadata()?;
@@ -118,7 +114,7 @@ pub fn build_tree(root: &Path, output_dir: &Path, exclude: &GlobSet) -> Result<V
     Ok(VaultTree { files_by_folder, subfolders })
 }
 
-// --- Mass: The Presentation Layer (Packing & Writing) ---
+// --- Mass: Presentation & Grouping ---
 
 fn pack_node(
     path: &Path,
@@ -130,7 +126,6 @@ fn pack_node(
     let mut finished = Vec::new();
     let mut bubbling = Vec::new();
 
-    // 1. Recurse into subfolders
     if let Some(subs) = tree.subfolders.get(path) {
         let mut sorted_subs: Vec<_> = subs.iter().collect();
         sorted_subs.sort();
@@ -141,7 +136,6 @@ fn pack_node(
         }
     }
 
-    // 2. Add local files at this node
     if let Some(locals) = tree.files_by_folder.get(path) {
         let mut sorted = locals.clone();
         match sort_by {
@@ -151,41 +145,37 @@ fn pack_node(
         bubbling.extend(sorted);
     }
 
-    // 3. Batching Logic (Resolved E0382 Move Error)
-    let mut current = GroupPlan { files: Vec::new(), estimated_bytes: 64 }; // Initial YAML/TOC Overhead
+    let mut current = GroupPlan { files: Vec::new(), estimated_bytes: 80 };
     for f in bubbling {
         let path_len = f.rel.to_string_lossy().len() as u64;
-        let overhead = 24 + (path_len * 2);
+        let overhead = 32 + (path_len * 2); // TOC line + Chapter Header + Padding
         let f_size = f.size;
 
-        // Behemoth Check
         if f_size + overhead > max_bytes {
             if !current.files.is_empty() { finished.push(current); }
             finished.push(GroupPlan { estimated_bytes: f_size + overhead, files: vec![f] });
-            current = GroupPlan { files: Vec::new(), estimated_bytes: 64 };
+            current = GroupPlan { files: Vec::new(), estimated_bytes: 80 };
             continue;
         }
 
-        let fits_size = current.estimated_bytes + f_size + overhead < max_bytes;
-        let fits_chapters = max_chapters == 0 || current.files.len() < max_chapters;
+        let fits = (current.estimated_bytes + f_size + overhead < max_bytes) &&
+            (max_chapters == 0 || current.files.len() < max_chapters);
 
-        if fits_size && fits_chapters {
+        if fits {
             current.estimated_bytes += f_size + overhead;
             current.files.push(f);
         } else {
             if !current.files.is_empty() { finished.push(current); }
-            current = GroupPlan { files: vec![f], estimated_bytes: f_size + overhead + 64 };
+            current = GroupPlan { files: vec![f], estimated_bytes: f_size + overhead + 80 };
         }
     }
-
     (finished, current)
 }
 
 pub fn run(cli: Cli) -> Result<()> {
     if cli.max_mb <= 0.0 { bail!("max_mb must be > 0"); }
-
     let out = cli.output_dir.clone().unwrap_or_else(|| cli.vault_root.join("_grouped"));
-    fs::create_dir_all(&out)?;
+    if !cli.dry_run { fs::create_dir_all(&out)?; }
 
     let mut gb = GlobSetBuilder::new();
     for p in cli.exclude { gb.add(Glob::new(&p)?); }
@@ -195,46 +185,49 @@ pub fn run(cli: Cli) -> Result<()> {
     let (mut groups, last) = pack_node(Path::new(""), &tree, max_b, cli.max_chapters, cli.sort_by);
     if !last.files.is_empty() { groups.push(last); }
 
-    let total_files: usize = groups.iter().map(|g| g.files.len()).sum();
-    let pb = ProgressBar::new(total_files as u64);
-    pb.set_style(ProgressStyle::default_bar().template("[{bar:40}] {pos}/{len} {msg}")?);
+    if cli.dry_run {
+        println!("Dry Run: Created {} groups with {} total files.", groups.len(), groups.iter().map(|g| g.files.len()).sum::<usize>());
+        return Ok(());
+    }
+
+    let mut group_map = HashMap::new();
+    let pb = ProgressBar::new(groups.len() as u64);
+    pb.set_style(ProgressStyle::default_bar().template("[{bar:40}] Pack {pos}/{len} - {msg}")?);
 
     for (i, g) in groups.iter().enumerate() {
-        let dest = out.join(format!("pack_{:04}.md", i + 1));
-        if cli.resume && dest.exists() {
-            pb.inc(g.files.len() as u64);
-            continue;
-        }
+        let name = format!("pack_{:04}.md", i + 1);
+        let dest = out.join(&name);
+        group_map.insert(name, g.files.iter().map(|f| f.rel.clone()).collect());
+
+        if cli.resume && dest.exists() { pb.inc(1); continue; }
 
         let mut tmp = NamedTempFile::new_in(&out)?;
         {
             let mut w = BufWriter::new(tmp.as_file_mut());
             writeln!(w, "---\nvault_group: {}\n---", i + 1)?;
             writeln!(w, "\n# Table of Contents")?;
-            for (idx, f) in g.files.iter().enumerate() {
-                writeln!(w, "{}. {}", idx + 1, f.rel.display())?;
-            }
+            for (idx, f) in g.files.iter().enumerate() { writeln!(w, "{}. {}", idx + 1, f.rel.display())?; }
 
             for (idx, f) in g.files.iter().enumerate() {
                 let mut src = File::open(&f.abs)?;
                 writeln!(w, "\n---\n# Chapter {}: {}\n", idx + 1, f.rel.display())?;
                 std::io::copy(&mut src, &mut w)?;
-                pb.inc(1);
             }
         }
         tmp.persist(dest)?;
+        pb.inc(1);
     }
 
     if cli.manifest {
         let m = Manifest {
             generated_at: std::time::SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-            total_groups: groups.len(),
-            total_files,
+            config: format!("max_mb: {}, sort: {:?}", cli.max_mb, cli.sort_by),
+            group_map,
         };
         fs::write(out.join("manifest.json"), serde_json::to_string_pretty(&m)?)?;
     }
 
-    pb.finish_with_message("Done.");
+    pb.finish_with_message("Success.");
     Ok(())
 }
 
