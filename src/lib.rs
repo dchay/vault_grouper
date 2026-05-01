@@ -1,5 +1,5 @@
-//! obsidian_vault_grouper v1.6.5
-//! The Aegis Edition: Parallel Discovery, UUID Atomicity, and Windows 11 Sentinel.
+//! obsidian_vault_grouper v1.6.6
+//! The Aegis Edition: Refined for Windows 11 Production.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -11,15 +11,16 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use jwalk::WalkDir; // Parallel walking for Windows performance
+use jwalk::WalkDir;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Serialize, Deserialize};
 use sha2::{Sha256, Digest};
 use tempfile::NamedTempFile;
 use rayon::prelude::*;
-use uuid::Uuid;    // Collision-proof backups
-use dunce;       // Windows long-path safety
+use uuid::Uuid;
+use dunce;
+use atty; // Added missing import for TTY detection
 
 // --- Brain: Constants & Logic ---
 const YAML_BASE: u64 = 64;
@@ -33,7 +34,7 @@ const MAX_RECURSION_DEPTH: u32 = 500;
 pub enum SortBy { Name, Mtime }
 
 #[derive(Parser)]
-#[command(name = "grouper", version = "1.6.5", about = "Enterprise-grade Obsidian vault grouping.")]
+#[command(name = "grouper", version = "1.6.6", about = "Enterprise-grade Obsidian vault grouping.")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -106,15 +107,15 @@ pub struct PackInfo {
     pub files: Vec<String>,
 }
 
-// --- Apparatus: Optimized Discovery & Windows Normalization ---
+// --- Apparatus: Optimized Discovery ---
 
 fn is_reserved_name(name: &str) -> bool {
     let n = name.to_uppercase();
     let reserved = ["CON", "PRN", "AUX", "NUL", "CLOCK$"];
     if reserved.contains(&n.as_str()) { return true; }
 
-    // Check for COM1-9 and LPT1-9
-    if (n.starts_with("COM") || n.starts_with("LPT")) && n.len() >= 4 {
+    // Logic Fix: Only match exact COM1-9 or LPT1-9 (length must be 4)
+    if n.len() == 4 && (n.starts_with("COM") || n.starts_with("LPT")) {
         if let Some(c) = n.chars().nth(3) {
             if c.is_ascii_digit() { return true; }
         }
@@ -122,24 +123,16 @@ fn is_reserved_name(name: &str) -> bool {
     false
 }
 
-fn normalize_path_for_discovery(path: &Path) -> PathBuf {
-    if cfg!(windows) {
-        PathBuf::from(path.to_string_lossy().to_lowercase().replace('\\', "/"))
-    } else {
-        path.to_path_buf()
-    }
-}
-
 fn build_globset(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pat in patterns {
-        let normalized = pat.replace('\\', "/"); // Fix Windows backslashes in globs
+        let normalized = pat.replace('\\', "/");
         builder.add(Glob::new(&normalized)?);
     }
     Ok(builder.build()?)
 }
 
-pub fn scan_vault(root: &Path, out: &Path, excludes: &GlobSet) -> Result<BrainState> {
+pub fn scan_vault(root: &Path, out: &Path, excludes: &GlobSet, quiet: bool) -> Result<BrainState> {
     let mut files_by_folder = HashMap::new();
     let mut subfolders = HashMap::new();
     let root_canonical = dunce::canonicalize(root).context("Failed to resolve vault root path")?;
@@ -147,16 +140,18 @@ pub fn scan_vault(root: &Path, out: &Path, excludes: &GlobSet) -> Result<BrainSt
 
     subfolders.insert(PathBuf::from(""), HashSet::new());
 
-    // jwalk provides parallel directory walking for significant performance gains on Windows
     let walker = WalkDir::new(root)
         .follow_links(false)
         .sort(true);
 
     for entry in walker.into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
-        let file_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
-        if is_reserved_name(file_name) { continue; }
+        if is_reserved_name(file_stem) {
+            if !quiet { eprintln!("Warning: Skipping reserved name: {}", path.display()); }
+            continue;
+        }
 
         if let Some(ref o) = out_canonical {
             if path.starts_with(o) { continue; }
@@ -168,9 +163,8 @@ pub fn scan_vault(root: &Path, out: &Path, excludes: &GlobSet) -> Result<BrainSt
 
             if excludes.is_match(&rel_unix) { continue; }
 
-            // Brain: Path normalization to handle Windows case-insensitivity
-            let parent_raw = rel.parent().unwrap_or_else(|| Path::new(""));
-            let parent = normalize_path_for_discovery(parent_raw);
+            // Blocker Fix: Removed normalize_path_for_discovery to ensure HashMap key consistency
+            let parent = rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
 
             let mut curr = parent.as_path();
             while let Some(p) = curr.parent() {
@@ -285,7 +279,7 @@ pub fn run() -> Result<()> {
             if !dry_run { fs::create_dir_all(&out)?; }
 
             let excludes_set = build_globset(&exclude)?;
-            let state = scan_vault(&vault_root, &out, &excludes_set)?;
+            let state = scan_vault(&vault_root, &out, &excludes_set, quiet)?;
 
             let capacity = (max_mb * 1024.0 * 1024.0) as u64;
             let available = if capacity > SAFETY_MARGIN { capacity - SAFETY_MARGIN } else { capacity };
@@ -306,7 +300,6 @@ pub fn run() -> Result<()> {
                 return Ok(());
             }
 
-            // TTY and NO_COLOR check for Windows 11 terminal compatibility
             let show_progress = !quiet && !no_progress && atty::is(atty::Stream::Stdout) && std::env::var("NO_COLOR").is_err();
             let mut pack_pb = None;
             if show_progress {
@@ -315,7 +308,7 @@ pub fn run() -> Result<()> {
                 pack_pb = Some(pb);
             }
 
-            let mut manifest_data = Manifest { version: "1.6.5".into(), packs: HashMap::new() };
+            let mut manifest_data = Manifest { version: "1.6.6".into(), packs: HashMap::new() };
 
             for (i, p) in packs.iter().enumerate() {
                 let pack_name = format!("pack_{:04}.md", i + 1);
@@ -355,7 +348,7 @@ pub fn run() -> Result<()> {
                         while let Ok(n) = src.read(&mut buf) {
                             if n == 0 { break; }
                             if written + (n as u64) > capacity + SAFETY_MARGIN {
-                                bail!("IO Error: Pack {} exceeds hardware capacity limits.", pack_name);
+                                bail!("IO Error: Pack {} exceeds capacity limits.", pack_name);
                             }
                             writer.write_all(&buf[..n])?;
                             hasher.update(&buf[..n]);
@@ -369,9 +362,10 @@ pub fn run() -> Result<()> {
                     files: p.files.iter().map(|f| f.rel_unix.clone()).collect(),
                 });
 
-                // Atomic Swap with Entropy-Based Backups for Windows Integrity
                 if dest.exists() {
-                    let backup = dest.with_extension(format!("bak_{}", Uuid::new_v4().simple()));
+                    // Logic Fix: Using 8-character UUID suffix for MAX_PATH safety
+                    let suffix = &Uuid::new_v4().simple().to_string()[..8];
+                    let backup = dest.with_extension(format!("bak_{}", suffix));
                     fs::rename(&dest, &backup).context("Failed to backup existing pack")?;
 
                     if let Err(e) = tmp.persist(&dest) {
