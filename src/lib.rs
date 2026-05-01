@@ -246,3 +246,9 @@ pub fn run(cli: Cli) -> Result<()> {
 
     Ok(())
 }
+
+/// The main entry point for the CLI, called by main.rs.
+pub fn run_cli() -> Result<()> {
+    let cli = Cli::parse();
+    run(cli)
+}
