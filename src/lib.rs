@@ -1,5 +1,6 @@
-//! obsidian_vault_grouper v0.1.9
+//! obsidian_vault_grouper v0.2.0
 //! Library crate: core logic + CLI runner.
+//! Optimized for Gemini/NotebookLM context windows using recursive folder grouping.
 
 #![forbid(unsafe_code)]
 #![warn(clippy::pedantic)]
@@ -24,7 +25,9 @@ use tempfile::NamedTempFile;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use walkdir::WalkDir;
 
-pub const DEFAULT_MAX_MB: f64 = 20.0; // Optimized for Gemini's long context[cite: 2]
+// --- Constants & Config ---
+
+pub const DEFAULT_MAX_MB: f64 = 20.0; // Optimized for Gemini "Needle in a Haystack" performance
 pub const DEFAULT_OVERHEAD_PER_CHAPTER: u64 = 512;
 pub const DEFAULT_READ_CHUNK: usize = 256 * 1024;
 pub const DEFAULT_WRITE_BUFFER: usize = 256 * 1024;
@@ -54,68 +57,62 @@ pub struct Cli {
 
     // --- TECHNICAL CONSTRAINTS ---
     /// Target maximum size for each group file in MB.
-    /// Set to 20MB for optimal Gemini performance.
     #[arg(long, default_value_t = DEFAULT_MAX_MB, help_heading = "Technical Limits")]
     pub max_mb: f64,
 
-    /// Maximum number of 'chapters' (original .md files) per group. 0 = unlimited.[cite: 2]
+    /// Maximum number of 'chapters' per group. 0 = unlimited.
     #[arg(long, default_value_t = 0, help_heading = "Technical Limits")]
     pub max_chapters: usize,
 
-    /// Sorting logic for files within a folder.[cite: 2]
+    /// Sorting logic for files within a folder.
     #[arg(long, value_enum, default_value_t = SortBy::Name, help_heading = "Technical Limits")]
     pub sort_by: SortBy,
 
     // --- WORKFLOW ---
-    /// Overwrite existing files in the output directory.[cite: 2]
+    /// Overwrite existing files in the output directory.
     #[arg(long, action = ArgAction::SetTrue, help_heading = "Workflow")]
     pub force: bool,
 
-    /// Skip processing folders where the output file already exists.[cite: 2]
+    /// Skip processing if output file already exists.
     #[arg(long, action = ArgAction::SetTrue, help_heading = "Workflow")]
     pub resume: bool,
 
-    /// Print statistics and planned groups without writing any files.[cite: 2]
+    /// Print statistics and planned groups without writing any files.
     #[arg(long, action = ArgAction::SetTrue, help_heading = "Workflow")]
     pub dry_run: bool,
 
-    /// Print vault statistics only; do not write group-files.[cite: 2]
+    /// Print vault statistics only.
     #[arg(long, action = ArgAction::SetTrue, help_heading = "Workflow")]
     pub stats_only: bool,
 
-    /// Glob patterns to skip (e.g., --exclude '**/templates/**').[cite: 2]
+    /// Glob patterns to skip (e.g., --exclude '**/templates/**').
     #[arg(long = "exclude", help_heading = "Workflow")]
     pub exclude_patterns: Vec<String>,
 
     // --- OUTPUT STYLE ---
-    /// Filename prefix for the resulting groups.[cite: 2]
+    /// Filename prefix for the resulting groups.
     #[arg(long = "output-prefix", default_value = "folder_pack_", help_heading = "Output Style")]
     pub output_prefix: String,
 
-    /// Disable the generation of vault_manifest.json.[cite: 2]
+    /// Disable the generation of vault_manifest.json.
     #[arg(long = "no-manifest", action = ArgAction::SetTrue, help_heading = "Output Style")]
     pub no_manifest: bool,
 
-    /// Indent the JSON manifest for human readability.[cite: 2]
+    /// Indent the JSON manifest for human readability.
     #[arg(long = "indent-manifest", action = ArgAction::SetTrue, help_heading = "Output Style")]
     pub indent_manifest: bool,
 
     // --- UI & LOGGING ---
-    /// Extra diagnostic output on stderr.[cite: 2]
     #[arg(short, long, action = ArgAction::SetTrue)]
     pub verbose: bool,
 
-    /// Suppress progress bars and summaries.[cite: 2]
     #[arg(short, long, action = ArgAction::SetTrue)]
     pub quiet: bool,
 
-    /// Disable interactive progress bars for CI/CD environments.[cite: 2]
     #[arg(long = "no-progress", action = ArgAction::SetTrue)]
     pub no_progress: bool,
 
-    // --- PLACEHOLDERS FOR YOUR INPUT ---
-    // TODO: Add a flag to filter by project-specific frontmatter (e.g., status: "ready").[cite: 2]
-    // TODO: Add a flag for 'Strict Folder Mode' vs 'Hybrid' (where small folders merge).[cite: 2]
+    // TODO: Add a flag for "Depth Limit" to stop consolidation at a specific level.
 }
 
 #[derive(Debug)]
@@ -129,6 +126,7 @@ pub struct VaultConfig {
     pub exclude: GlobSet,
     pub max_chapters: usize,
     pub output_prefix: String,
+    pub force: bool,
 }
 
 impl VaultConfig {
@@ -151,6 +149,7 @@ impl VaultConfig {
             exclude,
             max_chapters: cli.max_chapters,
             output_prefix: cli.output_prefix.clone(),
+            force: cli.force,
         })
     }
 }
@@ -175,75 +174,205 @@ impl GroupPlan {
         Self { index, files: Vec::new(), estimated_bytes: 0 }
     }
 
-    pub fn chapter_count(&self) -> usize {
-        self.files.len()
-    }
-
     pub fn can_fit(&self, md: &MdFile, cfg: &VaultConfig) -> bool {
         if cfg.max_chapters > 0 && self.files.len() >= cfg.max_chapters {
             return false;
         }
-        self.estimated_bytes + md.size + cfg.overhead_per_chapter < cfg.max_bytes
+        let overhead = if self.files.is_empty() { 0 } else { cfg.overhead_per_chapter };
+        
+        self.estimated_bytes
+            .checked_add(md.size)
+            .and_then(|s| s.checked_add(overhead))
+            .map_or(false, |total| total < cfg.max_bytes)
     }
 
     pub fn add(&mut self, md: MdFile, cfg: &VaultConfig, is_solo: bool) {
         let overhead = if is_solo { 0 } else { cfg.overhead_per_chapter };
-        self.estimated_bytes += md.size + overhead;
+        self.estimated_bytes = self.estimated_bytes
+            .checked_add(md.size)
+            .and_then(|s| s.checked_add(overhead))
+            .expect("Vault size calculation overflowed u64 limit");
         self.files.push(md);
     }
 }
 
-#[derive(Debug)]
-pub struct WriteResult {
-    pub group_index: usize,
-    pub path: PathBuf,
-    pub bytes_written: u64,
-    pub chapter_count: usize,
-    pub skipped: bool,
+// --- Internal State Management ---
+
+struct PackingState {
+    io_buffer: Vec<u8>,
+    next_group_index: usize,
+    warnings: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ManifestChapter {
-    pub chapter: usize,
-    pub source: String,
-    pub bytes: u64,
-    pub mtime: f64,
-    pub sha256: String,
+impl PackingState {
+    fn new(buffer_size: usize) -> Self {
+        Self {
+            io_buffer: vec![0u8; buffer_size],
+            next_group_index: 1,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn get_and_inc_index(&mut self) -> usize {
+        let idx = self.next_group_index;
+        self.next_group_index += 1;
+        idx
+    }
 }
 
-#[derive(Debug, Serialize)]
-pub struct ManifestGroup {
-    pub index: usize,
-    pub filename: String,
-    pub bytes_written: Option<u64>,
-    pub skipped: bool,
-    pub chapters: Vec<ManifestChapter>,
+// --- Logic Implementation ---
+
+pub fn pack_into_groups(md_files: &[MdFile], cfg: &VaultConfig) -> (Vec<GroupPlan>, Vec<String>) {
+    let mut state = PackingState::new(cfg.read_chunk);
+    
+    let mut sorted_files = md_files.to_vec();
+    sorted_files.sort_by(|a, b| a.rel.cmp(&b.rel));
+
+    let (mut groups, remainder) = pack_directory_recursive(
+        Path::new(""), 
+        cfg, 
+        &sorted_files, 
+        &mut state
+    );
+
+    if !remainder.is_empty() {
+        let mut final_group = GroupPlan::new(state.get_and_inc_index());
+        for md in remainder {
+            final_group.add(md, cfg, final_group.files.is_empty());
+        }
+        groups.push(final_group);
+    }
+
+    (groups, state.warnings)
 }
 
-#[derive(Debug, Serialize)]
-pub struct ManifestRoot {
-    pub version: String,
-    pub generated_at: String,
-    pub vault_root_posix: String,
-    pub vault_root_native: String,
-    pub max_mb: f64,
-    pub groups: Vec<ManifestGroup>,
+fn pack_directory_recursive(
+    current_rel_path: &Path,
+    cfg: &VaultConfig,
+    all_files: &[MdFile],
+    state: &mut PackingState,
+) -> (Vec<GroupPlan>, Vec<MdFile>) {
+    let mut finished_groups = Vec::new();
+    let mut pending_from_children = Vec::new();
+
+    // 1. Identify immediate subdirectories
+    let mut subdirs: Vec<PathBuf> = all_files.iter()
+        .filter(|f| f.rel.starts_with(current_rel_path) && f.rel.parent().unwrap_or(Path::new("")) != current_rel_path)
+        .filter_map(|f| {
+            f.rel.strip_prefix(current_rel_path).ok()
+                .and_then(|p| p.components().next())
+                .map(|c| current_rel_path.join(c))
+        })
+        .collect();
+    subdirs.sort();
+    subdirs.dedup();
+
+    // 2. Recurse Bottom-up
+    for subdir in subdirs {
+        let (mut child_groups, mut child_rem) = 
+            pack_directory_recursive(&subdir, cfg, all_files, state);
+        finished_groups.append(&mut child_groups);
+        pending_from_children.append(&mut child_rem);
+    }
+
+    // 3. Local file collection
+    let local_files: Vec<MdFile> = all_files.iter()
+        .filter(|f| f.rel.parent().unwrap_or(Path::new("")) == current_rel_path)
+        .cloned()
+        .collect();
+    
+    let mut to_pack = pending_from_children;
+    to_pack.extend(local_files);
+
+    // 4. Grouping with Behemoth handling
+    let mut current_group = GroupPlan::new(state.next_group_index);
+    let mut remainder = Vec::new();
+
+    for md in to_pack {
+        if md.size >= cfg.max_bytes {
+            if !current_group.files.is_empty() {
+                state.get_and_inc_index();
+                finished_groups.push(current_group);
+            }
+            let mut solo_group = GroupPlan::new(state.get_and_inc_index());
+            solo_group.add(md, cfg, true);
+            finished_groups.push(solo_group);
+            current_group = GroupPlan::new(state.next_group_index);
+            continue;
+        }
+
+        if current_group.can_fit(&md, cfg) {
+            current_group.add(md, cfg, current_group.files.is_empty());
+        } else {
+            if !current_group.files.is_empty() {
+                state.get_and_inc_index();
+                finished_groups.push(current_group);
+            }
+            current_group = GroupPlan::new(state.next_group_index);
+            current_group.add(md, cfg, true);
+        }
+    }
+
+    remainder.extend(current_group.files);
+    (finished_groups, remainder)
 }
 
-pub fn path_to_posix(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+pub fn write_group(
+    group: &GroupPlan,
+    output_dir: &Path,
+    cfg: &VaultConfig,
+    state: &mut PackingState,
+    checksums: &mut HashMap<String, String>,
+    write_pb: &Option<ProgressBar>,
+) -> Result<u64> {
+    let filename = format!("{}{:04}.md", cfg.output_prefix, group.index);
+    let final_path = output_dir.join(&filename);
+
+    if cfg.force && final_path.exists() {
+        fs::remove_file(&final_path).context("Failed to remove existing file for --force overwrite")?;
+    }
+
+    let mut tmp = NamedTempFile::new_in(output_dir)?;
+    {
+        let mut w = BufWriter::with_capacity(cfg.write_buffer, tmp.as_file_mut());
+        
+        writeln!(w, "---\nvault_group: {}\nchapters: {}\n---\n", group.index, group.files.len())?;
+        writeln!(w, "# Group {}\n\n## Table of Contents\n", group.index)?;
+        for (i, f) in group.files.iter().enumerate() {
+            writeln!(w, "{}. `{}`", i + 1, f.rel.display())?;
+        }
+
+        for (i, md) in group.files.iter().enumerate() {
+            if i > 0 { w.write_all(cfg.chapter_separator.as_bytes())?; }
+            
+            // TOCTOU re-verification
+            let mut f = File::open(&md.abs).context("Failed to open source file during writing phase")?;
+            let live_size = f.metadata()?.len();
+            if live_size > md.size * 2 {
+                state.warnings.push(format!("Warning: File {} size doubled since discovery.", md.rel.display()));
+            }
+
+            writeln!(w, "\n# Chapter {}\n**Source:** `{}`\n", i + 1, md.rel.display())?;
+            
+            let mut hasher = Sha256::new();
+            loop {
+                let n = f.read(&mut state.io_buffer)?;
+                if n == 0 { break; }
+                let chunk = &state.io_buffer[..n];
+                hasher.update(chunk);
+                w.write_all(chunk)?;
+            }
+            checksums.insert(md.rel.to_string_lossy().into_owned(), format!("{:x}", hasher.finalize()));
+            if let Some(pb) = write_pb { pb.inc(1); }
+        }
+        w.flush()?;
+    }
+    
+    tmp.persist(&final_path).context("Failed to persist group file to disk")?;
+    Ok(fs::metadata(final_path)?.len())
 }
 
-pub fn make_group_filename(prefix: &str, index: usize) -> String {
-    format!("{prefix}{index:04}.md")
-}
-
-fn is_excluded(rel: &Path, cfg: &VaultConfig) -> bool {
-    if cfg.exclude.is_empty() { return false; }
-    let posix = path_to_posix(rel);
-    if cfg.exclude.is_match(&posix) { return true; }
-    cfg.exclude.is_match(format!("{posix}/"))
-}
+// --- Discovery ---
 
 pub fn discover_md_files(
     root: &Path,
@@ -255,212 +384,110 @@ pub fn discover_md_files(
     let mut warnings = Vec::new();
     let mut count = 0usize;
 
-    let rel_out: Option<PathBuf> = exclude_out_dir
-        .and_then(|p| p.strip_prefix(root).ok())
-        .map(|p| p.to_path_buf());
+    let rel_out = exclude_out_dir.and_then(|p| p.strip_prefix(root).ok());
 
-    let cmp_fn: Box<dyn Fn(&walkdir::DirEntry, &walkdir::DirEntry) -> std::cmp::Ordering + Send + Sync> = match cfg.sort_by {
-        SortBy::Name => Box::new(|a, b| a.file_name().to_string_lossy().to_lowercase().cmp(&b.file_name().to_string_lossy().to_lowercase())),
-        SortBy::Mtime => Box::new(|a, b| {
-            let ta = a.metadata().ok().and_then(|m| m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH);
-            let tb = b.metadata().ok().and_then(|m| m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH);
-            ta.cmp(&tb).then_with(|| a.file_name().to_string_lossy().cmp(&b.file_name().to_string_lossy()))
-        }),
-    };
-
-    let walker = WalkDir::new(root).min_depth(1).follow_links(false).sort_by(cmp_fn);
+    let walker = WalkDir::new(root).min_depth(1).follow_links(false).sort_by(|a, b| {
+        a.file_name().cmp(b.file_name())
+    });
 
     for entry_r in walker {
         let entry = match entry_r { Ok(e) => e, Err(e) => { warnings.push(format!("Walk error: {e}")); continue; }};
         let path = entry.path();
         let rel = match path.strip_prefix(root) { Ok(r) => r, Err(_) => continue };
-        if let Some(ref out_rel) = rel_out { if rel.starts_with(out_rel) { continue; } }
-        if is_excluded(rel, cfg) { continue; }
+        
+        if let Some(out_rel) = rel_out { if rel.starts_with(out_rel) { continue; } }
         if entry.file_type().is_dir() { continue; }
-        if entry.file_type().is_file() && path.extension() == Some(OsStr::new("md")) {
-            let meta = match entry.metadata() { Ok(m) => m, Err(e) => { warnings.push(format!("Cannot stat {}: {e}", path.display())); continue; }};
-            results.push(MdFile { abs: path.to_path_buf(), rel: rel.to_path_buf(), size: meta.len(), mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH) });
-            count += 1;
-            if count % SCAN_TICK_BATCH == 0 { if let Some(pb) = scan_pb { pb.set_message(format!("Scanning… ({count} files found)")); pb.tick(); } }
-        }
-    }
-    if let Some(pb) = scan_pb { pb.finish_and_clear(); }
-    (results, warnings)
-}
-
-/// Rewritten core logic: Recursive "Deep Pack" consolidation.
-/// This bubbles up files from the deepest subdirectories and groups them
-/// with parents until the size limit is hit.
-pub fn pack_into_groups(md_files: &[MdFile], cfg: &VaultConfig) -> (Vec<GroupPlan>, Vec<String>) {
-    // Explicitly type the Vec to resolve E0282
-    let mut final_groups: Vec<GroupPlan> = Vec::new();
-    let warnings: Vec<String> = Vec::new();
-
-    // 1. Build the tree-like structure
-    let mut tree: HashMap<PathBuf, Vec<MdFile>> = HashMap::new();
-    let mut folders: Vec<PathBuf> = Vec::new();
-
-    for md in md_files {
-        let parent = md.rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
-        if !tree.contains_key(&parent) {
-            folders.push(parent.clone());
-        }
-        tree.entry(parent).or_default().push(md.clone());
-    }
-
-    // Sort folders by depth (longest paths first)[cite: 2]
-    folders.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
-
-    let mut current_pack = GroupPlan::new(1);
-
-    // 2. Process folders from the leaves up to the root[cite: 2]
-    for folder in folders {
-        if let Some(files) = tree.get(&folder) {
-            for md in files {
-                // If a single file is a behemoth, isolate it[cite: 2]
-                if md.size >= cfg.max_bytes {
-                    if !current_pack.files.is_empty() {
-                        final_groups.push(current_pack);
-                        current_pack = GroupPlan::new(final_groups.len() + 1);
-                    }
-                    current_pack.add(md.clone(), cfg, true);
-                    final_groups.push(current_pack);
-                    current_pack = GroupPlan::new(final_groups.len() + 1);
-                    continue;
+        if path.extension() == Some(OsStr::new("md")) {
+            if let Ok(meta) = entry.metadata() {
+                results.push(MdFile {
+                    abs: path.to_path_buf(),
+                    rel: rel.to_path_buf(),
+                    size: meta.len(),
+                    mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                });
+                count += 1;
+                if count % SCAN_TICK_BATCH == 0 {
+                    if let Some(pb) = scan_pb { pb.set_message(format!("Found {count} files...")); }
                 }
-
-                // Consolidation check[cite: 2]
-                if !current_pack.can_fit(md, cfg) {
-                    final_groups.push(current_pack);
-                    current_pack = GroupPlan::new(final_groups.len() + 1);
-                }
-                current_pack.add(md.clone(), cfg, current_pack.files.is_empty());
             }
         }
     }
-
-    if !current_pack.files.is_empty() {
-        final_groups.push(current_pack);
-    }
-
-    (final_groups, warnings)
+    (results, warnings)
 }
 
-pub fn write_group(
-    group: &GroupPlan,
-    output_dir: &Path,
-    cfg: &VaultConfig,
-    checksums: &mut HashMap<String, String>,
-    warnings: &mut Vec<String>,
-    write_pb: &Option<ProgressBar>,
-    verbose: bool,
-) -> Result<WriteResult> {
-    let filename = make_group_filename(&cfg.output_prefix, group.index);
-    let final_path = output_dir.join(&filename);
-    let total = group.chapter_count();
+// --- Manifest ---
 
-    let mut tmp = NamedTempFile::new_in(output_dir)?;
-    let mut w = BufWriter::with_capacity(cfg.write_buffer, tmp.as_file_mut());
-
-    writeln!(w, "---\nvault_group: {}\nchapters: {}\n---\n", group.index, total)?;
-    writeln!(w, "# Vault Group {}\n\n## Table of Contents\n", group.index)?;
-    for (i, md) in group.files.iter().enumerate() {
-        writeln!(w, "{}. `{}`", i + 1, path_to_posix(&md.rel))?;
-    }
-    writeln!(w)?;
-
-    for (i, md) in group.files.iter().enumerate() {
-        if i > 0 { w.write_all(cfg.chapter_separator.as_bytes())?; }
-        let rel_posix = path_to_posix(&md.rel);
-        writeln!(w, "# Chapter {} of {total}\n\n**source:** {}\n", i + 1, rel_posix)?;
-
-        let mut file = File::open(&md.abs)?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0_u8; cfg.read_chunk];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 { break; }
-            let chunk = &buf[..n];
-            hasher.update(chunk);
-            w.write_all(chunk)?;
-        }
-        w.write_all(b"\n")?;
-        checksums.insert(rel_posix, format!("{:x}", hasher.finalize()));
-        if let Some(pb) = write_pb { pb.inc(1); }
-    }
-    w.flush()?;
-    drop(w);
-    tmp.persist(&final_path)?;
-    Ok(WriteResult { group_index: group.index, path: final_path, bytes_written: fs::metadata(&output_dir.join(&filename))?.len(), chapter_count: total, skipped: false })
+#[derive(Debug, Serialize)]
+struct Manifest {
+    generated_at: String,
+    files_packed: usize,
+    groups: usize,
+    checksums: HashMap<String, String>,
 }
 
-pub fn write_manifest(root: &Path, output_dir: &Path, cfg: &VaultConfig, groups: &[GroupPlan], write_results: &[WriteResult], checksums: &HashMap<String, String>, indent: bool) -> Result<PathBuf> {
-    let result_map: HashMap<usize, &WriteResult> = write_results.iter().map(|wr| (wr.group_index, wr)).collect();
-    let manifest_groups: Vec<ManifestGroup> = groups.iter().map(|g| {
-        let fname = make_group_filename(&cfg.output_prefix, g.index);
-        let out_path = output_dir.join(&fname);
-        let (bytes_written, skipped) = if let Some(wr) = result_map.get(&g.index) { (Some(wr.bytes_written), wr.skipped) } else { (fs::metadata(&out_path).map(|m| m.len()).ok(), true) };
-        let chapters = g.files.iter().enumerate().map(|(i, md)| {
-            let rel_posix = path_to_posix(&md.rel);
-            ManifestChapter { chapter: i + 1, source: rel_posix.clone(), bytes: md.size, mtime: md.mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs_f64(), sha256: checksums.get(&rel_posix).cloned().unwrap_or_default() }
-        }).collect();
-        ManifestGroup { index: g.index, filename: fname, bytes_written, skipped, chapters }
-    }).collect();
-
-    let manifest = ManifestRoot {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+pub fn write_manifest(output_dir: &Path, files_count: usize, groups_count: usize, checksums: HashMap<String, String>, indent: bool) -> Result<()> {
+    let manifest = Manifest {
         generated_at: OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),
-        vault_root_posix: path_to_posix(root),
-        vault_root_native: root.to_string_lossy().into_owned(),
-        max_mb: (cfg.max_bytes as f64 / 1_048_576.0),
-        groups: manifest_groups,
+        files_packed: files_count,
+        groups: groups_count,
+        checksums,
     };
-    let manifest_path = output_dir.join("vault_manifest.json");
-    let file = File::create(&manifest_path)?;
-    if indent { serde_json::to_writer_pretty(BufWriter::new(file), &manifest)?; } else { serde_json::to_writer(BufWriter::new(file), &manifest)?; }
-    Ok(manifest_path)
+    let path = output_dir.join("vault_manifest.json");
+    let file = File::create(path)?;
+    if indent {
+        serde_json::to_writer_pretty(file, &manifest)?;
+    } else {
+        serde_json::to_writer(file, &manifest)?;
+    }
+    Ok(())
 }
 
-pub fn make_scan_pb(mp: &MultiProgress, enabled: bool) -> Option<ProgressBar> {
-    if !enabled { return None; }
-    let pb = mp.add(ProgressBar::new_spinner());
-    pb.set_style(ProgressStyle::with_template("{spinner} {msg}").unwrap().tick_chars("/-\\| "));
-    Some(pb)
-}
-
-pub fn make_write_pb(mp: &MultiProgress, total: u64, enabled: bool) -> Option<ProgressBar> {
-    if !enabled || total == 0 { return None; }
-    let pb = mp.add(ProgressBar::new(total));
-    pb.set_style(ProgressStyle::with_template("{spinner} Writing [{bar:40.cyan/blue}] {pos}/{len}").unwrap().progress_chars("█▉▊▋▌▍▎▏ "));
-    Some(pb)
-}
+// --- Runner ---
 
 pub fn run(cli: Cli) -> Result<()> {
     let cfg = VaultConfig::from_cli(&cli)?;
     let output_dir = cli.output_dir.clone().unwrap_or_else(|| cli.vault_root.join("_grouped"));
-    if !cli.dry_run && !cli.stats_only { fs::create_dir_all(&output_dir)?; }
+    fs::create_dir_all(&output_dir)?;
 
     let mp = MultiProgress::new();
-    let scan_pb = make_scan_pb(&mp, !cli.no_progress && !cli.quiet);
+    let scan_pb = if cli.quiet || cli.no_progress { None } else {
+        let pb = mp.add(ProgressBar::new_spinner());
+        pb.set_style(ProgressStyle::default_spinner());
+        Some(pb)
+    };
+
     let (md_files, mut warnings) = discover_md_files(&cli.vault_root, Some(&output_dir), &cfg, &scan_pb);
+    if let Some(pb) = scan_pb { pb.finish_and_clear(); }
 
     let (groups, pack_warnings) = pack_into_groups(&md_files, &cfg);
     warnings.extend(pack_warnings);
 
-    if cli.dry_run {
-        for g in &groups { println!("Group {:04}: {} files", g.index, g.chapter_count()); }
+    if cli.dry_run || cli.stats_only {
+        println!("Dry run: Found {} groups across {} files.", groups.len(), md_files.len());
         return Ok(());
     }
 
+    let mut state = PackingState::new(cfg.read_chunk);
     let mut checksums = HashMap::new();
-    let mut write_results = Vec::new();
-    let write_pb = make_write_pb(&mp, groups.iter().map(|g| g.chapter_count() as u64).sum(), !cli.no_progress && !cli.quiet);
+    let write_pb = if cli.quiet || cli.no_progress { None } else {
+        let pb = mp.add(ProgressBar::new(md_files.len() as u64));
+        pb.set_style(ProgressStyle::default_bar().template("{bar:40} {pos}/{len} {msg}").unwrap());
+        Some(pb)
+    };
 
     for g in &groups {
-        write_results.push(write_group(g, &output_dir, &cfg, &mut checksums, &mut warnings, &write_pb, cli.verbose)?);
+        write_group(g, &output_dir, &cfg, &mut state, &mut checksums, &write_pb)?;
+    }
+    
+    if let Some(pb) = write_pb { pb.finish_with_message("Done!"); }
+
+    if !cli.no_manifest {
+        write_manifest(&output_dir, md_files.len(), groups.len(), checksums, cli.indent_manifest)?;
     }
 
-    if !cli.no_manifest { write_manifest(&cli.vault_root, &output_dir, &cfg, &groups, &write_results, &checksums, cli.indent_manifest)?; }
+    for w in warnings { eprintln!("Warning: {w}"); }
+    for w in state.warnings { eprintln!("Warning: {w}"); }
+
     Ok(())
 }
 
