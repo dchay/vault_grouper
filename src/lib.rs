@@ -1,17 +1,17 @@
-//! obsidian_vault_grouper v1.5.0
-//! Production-Ready Edition: Fixed Globbing, Shadowing, and Integrity.
+//! obsidian_vault_grouper v1.6.0
+//! Deterministic Edition: Fixed Order, Accurate Math, and Dry Run.
 
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{BufWriter, Write, Read, BufReader},
-    path::{Path, PathBuf}
+    io::{BufWriter, Write, Read},
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use walkdir::WalkDir;
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use jwalk::WalkDir;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Serialize, Deserialize};
 use sha2::{Sha256, Digest};
@@ -20,14 +20,14 @@ use tempfile::NamedTempFile;
 // --- Brain: Constants & Calculus ---
 const YAML_BASE: u64 = 64;
 const TOC_HEAD: u64 = 40;
-const CHAPTER_OVERHEAD_BASE: u64 = 60; // Base overhead per file (TOC line + Header)
+const CHAPTER_OVERHEAD_BASE: u64 = 25; // Optimized overhead per file
 const SAFETY_MARGIN: u64 = 10 * 1024; // 10KB buffer
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum SortBy { Name, Mtime }
 
 #[derive(Parser)]
-#[command(name = "grouper", version = "1.5.0", about = "High-performance Obsidian vault grouping.")]
+#[command(name = "grouper", version = "1.6.0", about = "Deterministic Obsidian vault grouping.")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -53,8 +53,10 @@ pub enum Commands {
         force: bool,
         #[arg(long)]
         manifest: bool,
+        #[arg(long)]
+        dry_run: bool,
     },
-    /// Verify the integrity of existing packs against manifest.json
+    /// Verify the integrity of existing packs
     Verify {
         #[arg(default_value = "_grouped/manifest.json")]
         manifest_path: PathBuf,
@@ -92,13 +94,11 @@ pub struct PackInfo {
     pub files: Vec<String>,
 }
 
-// --- Apparatus: Sensory Discovery ---
+// --- Apparatus: Sensory Discovery (Deterministic) ---
 
 fn build_globset(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
-    for pat in patterns {
-        builder.add(Glob::new(pat)?);
-    }
+    for pat in patterns { builder.add(Glob::new(pat)?); }
     Ok(builder.build()?)
 }
 
@@ -106,16 +106,14 @@ pub fn scan_vault(root: &Path, out: &Path, excludes: &GlobSet) -> Result<BrainSt
     let mut files_by_folder = HashMap::new();
     let mut subfolders = HashMap::new();
     let root_canonical = root.canonicalize()?;
-    let out_canonical = if out.exists() { Some(out.canonicalize()?) } else { None };
 
-    for entry in WalkDir::new(root).follow_links(false) {
-        let entry = entry?;
+    // Explicitly initialize the root key
+    subfolders.insert(PathBuf::from(""), HashSet::new());
+
+    // walkdir is deterministic if we sort after collection or use it sequentially
+    for entry in WalkDir::new(root).follow_links(false).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
-
-        // Skip output directory to prevent infinite loops
-        if let Some(ref o) = out_canonical {
-            if path.starts_with(o) { continue; }
-        }
+        if path.starts_with(out) { continue; }
 
         if path.extension().map_or(false, |ext| ext == "md") && entry.file_type().is_file() {
             let rel = path.strip_prefix(&root_canonical)?;
@@ -125,7 +123,7 @@ pub fn scan_vault(root: &Path, out: &Path, excludes: &GlobSet) -> Result<BrainSt
 
             let parent = rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
 
-            // Register hierarchy
+            // Build hierarchy upward
             let mut curr = parent.as_path();
             while let Some(p) = curr.parent() {
                 subfolders.entry(p.to_path_buf()).or_insert_with(HashSet::new).insert(curr.to_path_buf());
@@ -144,33 +142,33 @@ pub fn scan_vault(root: &Path, out: &Path, excludes: &GlobSet) -> Result<BrainSt
     Ok(BrainState { files_by_folder, subfolders })
 }
 
-// --- Brain: Recursive Bubbling Engine ---
+// --- Brain: Recursive Packing Engine ---
 
 fn pack_node(
     path: &Path,
     state: &BrainState,
-    max_bytes: u64,
+    available_bytes: u64,
     max_ch: usize,
     sort_by: SortBy,
     depth: u32,
 ) -> Result<(Vec<GroupPlan>, Vec<MdFile>)> {
-    if depth > 500 { bail!("Vault depth safety limit exceeded."); }
+    if depth > 500 { bail!("Recursion safety limit reached."); }
 
     let mut all_completed_packs = Vec::new();
     let mut current_pool = Vec::new();
 
-    // 1. Process Children
+    // 1. Process Child Nodes Deterministically
     if let Some(subs) = state.subfolders.get(path) {
         let mut sorted_subs: Vec<_> = subs.iter().collect();
-        sorted_subs.sort();
+        sorted_subs.sort(); // ENSURE ORDER
         for sub in sorted_subs {
-            let (mut child_packs, child_rem) = pack_node(sub, state, max_bytes, max_ch, sort_by, depth + 1)?;
+            let (mut child_packs, child_rem) = pack_node(sub, state, available_bytes, max_ch, sort_by, depth + 1)?;
             all_completed_packs.append(&mut child_packs);
             current_pool.extend(child_rem);
         }
     }
 
-    // 2. Add local files
+    // 2. Add Local Files
     if let Some(locals) = state.files_by_folder.get(path) {
         let mut sorted = locals.clone();
         match sort_by {
@@ -180,15 +178,15 @@ fn pack_node(
         current_pool.extend(sorted);
     }
 
-    // 3. Grouping logic
+    // 3. Sequential Grouping
     let mut final_remainder = Vec::new();
     let mut current_pack = GroupPlan { files: Vec::new(), est_size: YAML_BASE + TOC_HEAD };
 
     for f in current_pool {
         let file_overhead = CHAPTER_OVERHEAD_BASE + (f.rel_unix.len() as u64 * 2);
 
-        // Handle Behemoths: If single file + mandatory overhead exceeds limit
-        if f.size + file_overhead + YAML_BASE + TOC_HEAD > max_bytes {
+        // Behemoth Check (Calculated against absolute limit, not available_bytes)
+        if f.size + file_overhead + YAML_BASE + TOC_HEAD > available_bytes + SAFETY_MARGIN {
             let size = f.size;
             all_completed_packs.push(GroupPlan {
                 files: vec![f],
@@ -197,7 +195,7 @@ fn pack_node(
             continue;
         }
 
-        let fits = (current_pack.est_size + f.size + file_overhead < max_bytes) &&
+        let fits = (current_pack.est_size + f.size + file_overhead < available_bytes) &&
             (max_ch == 0 || current_pack.files.len() < max_ch);
 
         if fits {
@@ -219,79 +217,84 @@ fn pack_node(
     Ok((all_completed_packs, final_remainder))
 }
 
-// --- Mass: Presentation & Integrity ---
+// --- Mass: Presentation & Output ---
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Pack { vault_root, output_dir, max_mb, max_chapters, sort_by, exclude, resume, force, manifest } => {
+        Commands::Pack { vault_root, output_dir, max_mb, max_chapters, sort_by, exclude, resume, force, manifest, dry_run } => {
             let out = output_dir.unwrap_or_else(|| vault_root.join("_grouped"));
-            fs::create_dir_all(&out)?;
+            if !dry_run { fs::create_dir_all(&out)?; }
 
             let excludes_set = build_globset(&exclude)?;
             let state = scan_vault(&vault_root, &out, &excludes_set)?;
-            let max_b = (max_mb * 1024.0 * 1024.0) as u64;
 
-            let (mut packs, last) = pack_node(Path::new(""), &state, max_b, max_chapters, sort_by, 0)?;
+            // MATH: Estimation happens against capacity minus safety margin
+            let capacity = (max_mb * 1024.0 * 1024.0) as u64;
+            let available = if capacity > SAFETY_MARGIN { capacity - SAFETY_MARGIN } else { capacity };
+
+            let (mut packs, last) = pack_node(Path::new(""), &state, available, max_chapters, sort_by, 0)?;
             if !last.is_empty() {
                 packs.push(GroupPlan { files: last, est_size: 0 });
             }
 
-            let pb = ProgressBar::new(packs.len() as u64);
-            pb.set_style(ProgressStyle::default_bar().template("[{bar:40}] {pos}/{len} - {msg}")?);
+            if dry_run {
+                println!("Dry Run: Would create {} packs for {} total files.", packs.len(), packs.iter().map(|p| p.files.len()).sum::<usize>());
+                return Ok(());
+            }
 
-            let mut manifest_data = Manifest { version: "1.5.0".into(), packs: HashMap::new() };
+            let pb = ProgressBar::new(packs.len() as u64);
+            pb.set_style(ProgressStyle::default_bar().template("[{bar:40}] Pack {pos}/{len} - {msg}")?);
+
+            let mut manifest_data = Manifest { version: "1.6.0".into(), packs: HashMap::new() };
 
             for (i, p) in packs.iter().enumerate() {
                 let pack_name = format!("pack_{:04}.md", i + 1);
                 let dest = out.join(&pack_name);
 
                 if resume && !force && dest.exists() { pb.inc(1); continue; }
-                if force && dest.exists() { fs::remove_file(&dest)?; }
 
                 let tmp = NamedTempFile::new_in(&out)?;
                 let mut hasher = Sha256::new();
-                let mut current_written_size: u64 = 0;
+                let mut written: u64 = 0;
 
                 {
                     let mut writer = BufWriter::new(tmp.as_file());
                     let head = format!("---\nvault_group: {}\n---\n\n# Table of Contents\n", i + 1);
                     writer.write_all(head.as_bytes())?;
                     hasher.update(head.as_bytes());
-                    current_written_size += head.len() as u64;
+                    written += head.len() as u64;
 
                     for (idx, f) in p.files.iter().enumerate() {
                         let line = format!("{}. {}\n", idx + 1, f.rel_unix);
                         writer.write_all(line.as_bytes())?;
                         hasher.update(line.as_bytes());
-                        current_written_size += line.len() as u64;
+                        written += line.len() as u64;
                     }
 
                     for (idx, f) in p.files.iter().enumerate() {
                         let header = format!("\n---\n# Chapter {}: {}\n\n", idx + 1, f.rel_unix);
                         writer.write_all(header.as_bytes())?;
                         hasher.update(header.as_bytes());
-                        current_written_size += header.len() as u64;
+                        written += header.len() as u64;
 
-                        // Size-guarded stream copy
-                        let mut src = BufReader::new(File::open(&f.abs)?);
-                        let mut buffer = [0u8; 8192];
-                        while let Ok(n) = src.read(&mut buffer) {
+                        let mut src = File::open(&f.abs)?;
+                        let mut buf = [0u8; 8192];
+                        while let Ok(n) = src.read(&mut buf) {
                             if n == 0 { break; }
-                            if current_written_size + (n as u64) > max_b + SAFETY_MARGIN {
-                                bail!("Pack {} exceeded size limit during write. Source data may have changed.", pack_name);
+                            if written + (n as u64) > capacity {
+                                bail!("Pack {} overflowed capacity. Vault content changed during execution.", pack_name);
                             }
-                            writer.write_all(&buffer[..n])?;
-                            hasher.update(&buffer[..n]);
-                            current_written_size += n as u64;
+                            writer.write_all(&buf[..n])?;
+                            hasher.update(&buf[..n]);
+                            written += n as u64;
                         }
                     }
                 }
 
-                let checksum = format!("{:x}", hasher.finalize());
                 manifest_data.packs.insert(pack_name, PackInfo {
-                    checksum,
+                    checksum: format!("{:x}", hasher.finalize()),
                     files: p.files.iter().map(|f| f.rel_unix.clone()).collect(),
                 });
 
@@ -302,12 +305,12 @@ pub fn run() -> Result<()> {
             if manifest {
                 fs::write(out.join("manifest.json"), serde_json::to_string_pretty(&manifest_data)?)?;
             }
-            pb.finish_with_message("Vault packing complete.");
+            pb.finish_with_message("Done.");
         }
         Commands::Verify { manifest_path } => {
-            let m_content = fs::read_to_string(&manifest_path).context("Could not read manifest")?;
+            let m_content = fs::read_to_string(&manifest_path).context("Read manifest failed")?;
             let manifest: Manifest = serde_json::from_str(&m_content)?;
-            let base_dir = manifest_path.parent().unwrap();
+            let base_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
 
             for (name, info) in manifest.packs {
                 let p_path = base_dir.join(&name);
@@ -315,14 +318,13 @@ pub fn run() -> Result<()> {
 
                 let mut hasher = Sha256::new();
                 let mut f = File::open(p_path)?;
-                let mut buffer = [0u8; 8192];
-                while let Ok(n) = f.read(&mut buffer) {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = f.read(&mut buf) {
                     if n == 0 { break; }
-                    hasher.update(&buffer[..n]);
+                    hasher.update(&buf[..n]);
                 }
-                let hash = format!("{:x}", hasher.finalize());
 
-                if hash == info.checksum {
+                if format!("{:x}", hasher.finalize()) == info.checksum {
                     println!("[OK] {}", name);
                 } else {
                     println!("[CORRUPT] {}", name);
