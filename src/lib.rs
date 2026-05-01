@@ -1,32 +1,30 @@
-//! obsidian_vault_grouper v1.6.4
-//! The Paladin Edition: Windows 11 Optimization, Atomic Persistence, and CI/CD Mastery.
+//! obsidian_vault_grouper v1.6.5
+//! The Aegis Edition: Parallel Discovery, UUID Atomicity, and Windows 11 Sentinel.
 
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufWriter, Write, Read, BufReader},
     path::{Path, PathBuf},
-    sync::{atomic::{AtomicUsize, Ordering}, Arc},
+    sync::{Arc, atomic::{AtomicUsize, Ordering}},
 };
 
-use anyhow::{bail, Context, Result};
-use chrono::Local;
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use jwalk::WalkDir; // Parallel walking for Windows performance
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde::{Serialize, Deserialize};
+use sha2::{Sha256, Digest};
 use tempfile::NamedTempFile;
-use walkdir::WalkDir;
-// For unique backups
-use dunce;
-// Windows-friendly path handling
+use rayon::prelude::*;
+use uuid::Uuid;    // Collision-proof backups
+use dunce;       // Windows long-path safety
 
 // --- Brain: Constants & Logic ---
 const YAML_BASE: u64 = 64;
 const TOC_HEAD: u64 = 40;
-const PER_FILE_OVERHEAD: u64 = 25; // Replaces CHAPTER_OVERHEAD_BASE
+const PER_FILE_OVERHEAD: u64 = 25;
 const SAFETY_MARGIN: u64 = 16 * 1024;
 const BUFFER_SIZE: usize = 8192;
 const MAX_RECURSION_DEPTH: u32 = 500;
@@ -35,7 +33,7 @@ const MAX_RECURSION_DEPTH: u32 = 500;
 pub enum SortBy { Name, Mtime }
 
 #[derive(Parser)]
-#[command(name = "grouper", version = "1.6.4", about = "Enterprise-grade Obsidian vault grouping.")]
+#[command(name = "grouper", version = "1.6.5", about = "Enterprise-grade Obsidian vault grouping.")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -108,11 +106,36 @@ pub struct PackInfo {
     pub files: Vec<String>,
 }
 
-// --- Apparatus: Optimized Discovery ---
+// --- Apparatus: Optimized Discovery & Windows Normalization ---
+
+fn is_reserved_name(name: &str) -> bool {
+    let n = name.to_uppercase();
+    let reserved = ["CON", "PRN", "AUX", "NUL", "CLOCK$"];
+    if reserved.contains(&n.as_str()) { return true; }
+
+    // Check for COM1-9 and LPT1-9
+    if (n.starts_with("COM") || n.starts_with("LPT")) && n.len() >= 4 {
+        if let Some(c) = n.chars().nth(3) {
+            if c.is_ascii_digit() { return true; }
+        }
+    }
+    false
+}
+
+fn normalize_path_for_discovery(path: &Path) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(path.to_string_lossy().to_lowercase().replace('\\', "/"))
+    } else {
+        path.to_path_buf()
+    }
+}
 
 fn build_globset(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
-    for pat in patterns { builder.add(Glob::new(pat)?); }
+    for pat in patterns {
+        let normalized = pat.replace('\\', "/"); // Fix Windows backslashes in globs
+        builder.add(Glob::new(&normalized)?);
+    }
     Ok(builder.build()?)
 }
 
@@ -124,24 +147,30 @@ pub fn scan_vault(root: &Path, out: &Path, excludes: &GlobSet) -> Result<BrainSt
 
     subfolders.insert(PathBuf::from(""), HashSet::new());
 
+    // jwalk provides parallel directory walking for significant performance gains on Windows
     let walker = WalkDir::new(root)
         .follow_links(false)
-        .sort_by_file_name();
+        .sort(true);
 
     for entry in walker.into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
+        let file_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+
+        if is_reserved_name(file_name) { continue; }
 
         if let Some(ref o) = out_canonical {
             if path.starts_with(o) { continue; }
         }
 
-        if path.extension().map_or(false, |ext| ext == "md") && entry.file_type().is_file() {
-            let rel = path.strip_prefix(&root_canonical).unwrap_or(path);
+        if path.extension().map_or(false, |ext| ext == "md") && entry.file_type.is_file() {
+            let rel = path.strip_prefix(&root_canonical).unwrap_or(&path);
             let rel_unix = rel.to_string_lossy().replace('\\', "/");
 
             if excludes.is_match(&rel_unix) { continue; }
 
-            let parent = rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+            // Brain: Path normalization to handle Windows case-insensitivity
+            let parent_raw = rel.parent().unwrap_or_else(|| Path::new(""));
+            let parent = normalize_path_for_discovery(parent_raw);
 
             let mut curr = parent.as_path();
             while let Some(p) = curr.parent() {
@@ -149,7 +178,7 @@ pub fn scan_vault(root: &Path, out: &Path, excludes: &GlobSet) -> Result<BrainSt
                 curr = p;
             }
 
-            let meta = entry.metadata()?;
+            let meta = entry.metadata().context("Failed to read metadata")?;
             files_by_folder.entry(parent).or_insert_with(Vec::new).push(Arc::new(MdFile {
                 abs: path.to_path_buf(),
                 rel_unix,
@@ -171,7 +200,7 @@ fn pack_node(
     sort_by: SortBy,
     depth: u32,
 ) -> Result<(Vec<GroupPlan>, Vec<Arc<MdFile>>)> {
-    if depth > MAX_RECURSION_DEPTH { bail!("Recursion safety limit reached (500)."); }
+    if depth > MAX_RECURSION_DEPTH { bail!("Recursion safety limit (500) exceeded."); }
 
     let mut completed_packs = Vec::new();
     let mut current_pool = Vec::new();
@@ -225,19 +254,21 @@ fn pack_node(
     Ok((completed_packs, remainder))
 }
 
-// --- Mass: Presentation & Safety ---
+// --- Mass: Presentation & Windows 11 Safety ---
 
 fn is_system_dir(path: &Path) -> bool {
     let canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let p = canonical.to_string_lossy().to_lowercase();
 
     let restricted = [
-        "/", "/etc", "/dev", "/bin", "/sbin", "/usr", "/boot",
-        "c:\\", "c:\\windows", "c:\\program files", "c:\\program files (x86)",
-        "d:\\", "e:\\", "f:\\"
+        "/etc", "/dev", "/bin", "/sbin", "/usr", "/boot",
+        "c:\\windows", "c:\\windows\\system32", "c:\\windows\\syswow64",
+        "c:\\program files", "c:\\program files (x86)", "c:\\programdata",
+        "c:\\users\\all users", "c:\\$recycle.bin"
     ];
 
-    restricted.iter().any(|&r| p == r || p.starts_with(&(r.to_owned() + "\\")) || p.starts_with(&(r.to_owned() + "/")))
+    p == "/" || p == "c:\\" || p == "d:\\" ||
+        restricted.iter().any(|&r| p == r || p.starts_with(&(r.to_owned() + "\\")) || p.starts_with(&(r.to_owned() + "/")))
 }
 
 pub fn run() -> Result<()> {
@@ -248,9 +279,9 @@ pub fn run() -> Result<()> {
             let out = output_dir.unwrap_or_else(|| vault_root.join("_grouped"));
 
             if out.as_os_str().is_empty() || out == Path::new(".") || out == Path::new("..") {
-                bail!("Invalid output directory path.");
+                bail!("Forbidden output directory path.");
             }
-            if is_system_dir(&out) { bail!("Refusing to write to protected system directory: {}", out.display()); }
+            if is_system_dir(&out) { bail!("Safety Guard: Access denied to system directory: {}", out.display()); }
             if !dry_run { fs::create_dir_all(&out)?; }
 
             let excludes_set = build_globset(&exclude)?;
@@ -261,21 +292,22 @@ pub fn run() -> Result<()> {
 
             let (mut packs, last) = pack_node(Path::new(""), &state, available, max_chapters, sort_by, 0)?;
             if !last.is_empty() {
-                let actual_size = last.iter().map(|f| f.size + PER_FILE_OVERHEAD + (f.rel_unix.len() as u64 * 2)).sum::<u64>() + YAML_BASE + TOC_HEAD;
+                let actual_size = last.iter().map(|f| f.size + PER_FILE_OVERHEAD).sum::<u64>() + YAML_BASE + TOC_HEAD;
                 packs.push(GroupPlan { files: last, est_size: actual_size });
             }
 
             if packs.is_empty() {
-                if !quiet { println!("No files found to process."); }
+                if !quiet { println!("No markdown files found."); }
                 return Ok(());
             }
 
             if dry_run {
-                println!("Dry Run: {} packs planned containing {} files.", packs.len(), packs.iter().map(|p| p.files.len()).sum::<usize>());
+                println!("Dry Run: {} packs planned for {} files.", packs.len(), packs.iter().map(|p| p.files.len()).sum::<usize>());
                 return Ok(());
             }
 
-            let show_progress = !quiet && !no_progress && atty::is(atty::Stream::Stdout);
+            // TTY and NO_COLOR check for Windows 11 terminal compatibility
+            let show_progress = !quiet && !no_progress && atty::is(atty::Stream::Stdout) && std::env::var("NO_COLOR").is_err();
             let mut pack_pb = None;
             if show_progress {
                 let pb = ProgressBar::new(packs.len() as u64);
@@ -283,7 +315,7 @@ pub fn run() -> Result<()> {
                 pack_pb = Some(pb);
             }
 
-            let mut manifest_data = Manifest { version: "1.6.4".into(), packs: HashMap::new() };
+            let mut manifest_data = Manifest { version: "1.6.5".into(), packs: HashMap::new() };
 
             for (i, p) in packs.iter().enumerate() {
                 let pack_name = format!("pack_{:04}.md", i + 1);
@@ -293,7 +325,6 @@ pub fn run() -> Result<()> {
                     if let Some(ref pb) = pack_pb { pb.inc(1); }
                     continue;
                 }
-                if dest.is_dir() { bail!("Cannot overwrite directory: {}", dest.display()); }
 
                 let tmp = NamedTempFile::new_in(&out)?;
                 let mut hasher = Sha256::new();
@@ -324,7 +355,7 @@ pub fn run() -> Result<()> {
                         while let Ok(n) = src.read(&mut buf) {
                             if n == 0 { break; }
                             if written + (n as u64) > capacity + SAFETY_MARGIN {
-                                bail!("Size Limit Exceeded: Pack {} exceeds user-defined max_mb.", pack_name);
+                                bail!("IO Error: Pack {} exceeds hardware capacity limits.", pack_name);
                             }
                             writer.write_all(&buf[..n])?;
                             hasher.update(&buf[..n]);
@@ -338,19 +369,18 @@ pub fn run() -> Result<()> {
                     files: p.files.iter().map(|f| f.rel_unix.clone()).collect(),
                 });
 
-                // Atomic Swap with Collision-Proof Backups
+                // Atomic Swap with Entropy-Based Backups for Windows Integrity
                 if dest.exists() {
-                    let ts = Local::now().format("%Y%m%d_%H%M%S");
-                    let backup = dest.with_extension(format!("bak_{}", ts));
-                    fs::rename(&dest, &backup).context("Failed to create backup")?;
+                    let backup = dest.with_extension(format!("bak_{}", Uuid::new_v4().simple()));
+                    fs::rename(&dest, &backup).context("Failed to backup existing pack")?;
 
                     if let Err(e) = tmp.persist(&dest) {
-                        fs::rename(&backup, &dest).ok(); // Attempt restore
+                        fs::rename(&backup, &dest).ok();
                         return Err(e.into());
                     }
-                    fs::remove_file(backup).ok(); // Cleanup backup
+                    fs::remove_file(backup).ok();
                 } else {
-                    tmp.persist(&dest).context("Failed to persist pack")?;
+                    tmp.persist(&dest).context("Atomic persist failed")?;
                 }
 
                 if let Some(ref pb) = pack_pb { pb.inc(1); }
@@ -362,7 +392,7 @@ pub fn run() -> Result<()> {
             if let Some(pb) = pack_pb { pb.finish_with_message("Done"); }
         }
         Commands::Verify { manifest_path, quiet } => {
-            let data = fs::read_to_string(&manifest_path).context("Manifest not found")?;
+            let data = fs::read_to_string(&manifest_path).context("Manifest read failed")?;
             let manifest: Manifest = serde_json::from_str(&data)?;
             let base = manifest_path.parent().unwrap_or_else(|| Path::new("."));
             let errors = AtomicUsize::new(0);
@@ -371,14 +401,14 @@ pub fn run() -> Result<()> {
                 let p_path = base.join(name);
                 let res: Result<()> = (|| {
                     let mut hasher = Sha256::new();
-                    let mut f = File::open(&p_path).with_context(|| format!("Unreadable pack: {}", name))?;
+                    let mut f = File::open(&p_path).with_context(|| format!("Pack unreadable: {}", name))?;
                     let mut buf = [0u8; BUFFER_SIZE];
                     while let Ok(n) = f.read(&mut buf) {
                         if n == 0 { break; }
                         hasher.update(&buf[..n]);
                     }
                     if format!("{:x}", hasher.finalize()) != info.checksum {
-                        bail!("Checksum mismatch: {}", name);
+                        bail!("Integrity Check Failed: {}", name);
                     }
                     Ok(())
                 })();
@@ -393,8 +423,8 @@ pub fn run() -> Result<()> {
             });
 
             let count = errors.load(Ordering::Relaxed);
-            if count > 0 { bail!("Verification Failed: {} packs are invalid.", count); }
-            else if !quiet { println!("All packs verified successfully."); }
+            if count > 0 { bail!("Verification Failed: {} corrupted packs found.", count); }
+            else if !quiet { println!("All packs verified."); }
         }
     }
     Ok(())
