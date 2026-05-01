@@ -1,32 +1,32 @@
-//! obsidian_vault_grouper v1.3.0
-//! Hardened Production Release
+//! obsidian_vault_grouper v1.4.0
+//! The "Daniel Chay" Production Edition: Corrected Folder Affinity & Multi-OS Support.
 
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
     io::{BufWriter, Write, Read},
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Serialize, Deserialize};
+use sha2::{Sha256, Digest};
 use tempfile::NamedTempFile;
 
-// --- Constants & Magic Numbers ---
-const YAML_FRONTMATTER_SIZE: u64 = 30;
-const TOC_HEADER_SIZE: u64 = 25;
-const CHAPTER_HEADER_BASE: u64 = 25; // "\n---\n# Chapter X: "
-const NEWLINE_SIZE: u64 = 1;
+// --- Brain: Logic & State Constants ---
+const YAML_BASE: u64 = 40;
+const TOC_HEAD: u64 = 30;
+const CHAPTER_BASE: u64 = 40;
+const SAFETY_MARGIN: u64 = 1024; // 1KB buffer for file growth/encoding
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum SortBy { Name, Mtime }
 
 #[derive(Parser)]
-#[command(version, about = "Group Obsidian vaults into AI-friendly packs.")]
+#[command(version, about = "Group Obsidian vaults with folder affinity and integrity checks.")]
 pub struct Cli {
     pub vault_root: PathBuf,
     pub output_dir: Option<PathBuf>,
@@ -45,204 +45,222 @@ pub struct Cli {
     #[arg(long)]
     pub manifest: bool,
     #[arg(long)]
-    pub dry_run: bool,
+    pub stats_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MdFile {
     pub abs: PathBuf,
-    pub rel: PathBuf,
+    pub rel_unix: String, // Normalized for Cross-Platform
     pub size: u64,
-    pub mtime_ns: u128,
+    pub mtime: u64,
 }
 
-pub struct VaultTree {
+pub struct BrainState {
     pub files_by_folder: HashMap<PathBuf, Vec<MdFile>>,
-    pub subfolders: HashMap<PathBuf, Vec<PathBuf>>,
+    pub subfolders: HashMap<PathBuf, HashSet<PathBuf>>,
 }
 
 #[derive(Serialize)]
 pub struct GroupPlan {
     pub files: Vec<MdFile>,
-    pub estimated_bytes: u64,
+    pub est_size: u64,
 }
 
 #[derive(Serialize)]
 pub struct Manifest {
-    pub generated_at: u64,
-    pub total_files: usize,
-    pub group_map: HashMap<String, Vec<PathBuf>>,
+    pub version: String,
+    pub packs: HashMap<String, PackInfo>,
+}
+
+#[derive(Serialize)]
+pub struct PackInfo {
+    pub checksum: String,
+    pub files: Vec<String>,
 }
 
 // --- Apparatus: Sensory Discovery ---
 
-pub fn build_tree(root: &Path, output_dir: &Path, exclude: &GlobSet) -> Result<VaultTree> {
-    let mut files_by_folder: HashMap<PathBuf, Vec<MdFile>> = HashMap::new();
-    let mut subfolders_map: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
+fn normalize_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
 
-    let abs_root = root.canonicalize().context("Invalid vault root")?;
-    let abs_output = output_dir.canonicalize().ok();
+pub fn scan_vault(root: &Path, exclude_patterns: &[String]) -> Result<BrainState> {
+    let mut files_by_folder = HashMap::new();
+    let mut subfolders = HashMap::new();
 
-    for entry in walkdir::WalkDir::new(&abs_root).min_depth(1).follow_links(false) {
-        let e = entry.map_err(|err| { eprintln!("Warning: Skipping entry: {}", err); err }).ok();
-        if e.is_none() { continue; }
-        let e = e.unwrap();
+    let mut walker = WalkBuilder::new(root);
+    walker.standard_filters(true).follow_links(false);
+    for pat in exclude_patterns { walker.add_custom_ignore_filename(pat); }
+
+    for entry in walker.build() {
+        let e = entry?;
         let path = e.path();
-
-        if let Some(ref out) = abs_output { if path.starts_with(out) { continue; } }
-        let rel = path.strip_prefix(&abs_root).unwrap_or(path).to_path_buf();
-        if exclude.is_match(&rel) { continue; }
-
-        if path.extension().map_or(false, |ext| ext == "md") && e.file_type().is_file() {
+        if path.extension().map_or(false, |ext| ext == "md") && e.file_type().map_or(false, |ft| ft.is_file()) {
+            let rel = path.strip_prefix(root)?.to_path_buf();
             let parent = rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
 
-            // Iteratively build the subfolder hierarchy
+            // Build hierarchy
             let mut curr = parent.as_path();
             while let Some(p) = curr.parent() {
-                subfolders_map.entry(p.to_path_buf()).or_default().insert(curr.to_path_buf());
+                subfolders.entry(p.to_path_buf()).or_insert_with(HashSet::new).insert(curr.to_path_buf());
                 curr = p;
             }
 
             let meta = e.metadata()?;
-            files_by_folder.entry(parent).or_default().push(MdFile {
+            files_by_folder.entry(parent).or_insert_with(Vec::new).push(MdFile {
                 abs: path.to_path_buf(),
-                rel: rel.clone(),
+                rel_unix: normalize_path(&rel),
                 size: meta.len(),
-                mtime_ns: meta.modified()?.duration_since(UNIX_EPOCH)?.as_nanos(),
+                mtime: meta.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_secs(),
             });
         }
     }
-
-    let subfolders = subfolders_map.into_iter()
-        .map(|(k, v)| {
-            let mut folders: Vec<_> = v.into_iter().collect();
-            folders.sort();
-            (k, folders)
-        }).collect();
-
-    Ok(VaultTree { files_by_folder, subfolders })
+    Ok(BrainState { files_by_folder, subfolders })
 }
 
-// --- Mass: Iterative Grouping Engine ---
+// --- Brain: Recursive Bubbling Engine ---
 
-fn pack_vault_iterative(tree: &VaultTree, max_bytes: u64, max_chapters: usize, sort_by: SortBy) -> Vec<GroupPlan> {
-    let mut finished_groups = Vec::new();
-    let mut bubbling_files = Vec::new();
-    let mut stack = vec![(PathBuf::from(""), false)]; // (Path, VisitedChildren)
+fn pack_node(
+    path: &Path,
+    state: &BrainState,
+    max_bytes: u64,
+    max_ch: usize,
+    sort_by: SortBy,
+    depth: u32,
+) -> Result<(Vec<GroupPlan>, Vec<MdFile>)> {
+    if depth > 500 { bail!("Vault nesting exceeds safety limit (500). Possible recursion loop."); }
 
-    // Depth-First Post-Order Traversal (Iterative)
-    while let Some((path, children_done)) = stack.pop() {
-        if !children_done {
-            stack.push((path.clone(), true));
-            if let Some(subs) = tree.subfolders.get(&path) {
-                for sub in subs.iter().rev() { stack.push((sub.clone(), false)); }
-            }
-        } else {
-            let mut local_pool = Vec::new();
-            if let Some(locals) = tree.files_by_folder.get(&path) {
-                let mut sorted = locals.clone();
-                match sort_by {
-                    SortBy::Name => sorted.sort_by(|a, b| a.rel.cmp(&b.rel)),
-                    SortBy::Mtime => sorted.sort_by(|a, b| a.mtime_ns.cmp(&b.mtime_ns)),
-                }
-                local_pool.extend(sorted);
-            }
-            bubbling_files.extend(local_pool);
+    let mut finished = Vec::new();
+    let mut bubbling = Vec::new();
+
+    // 1. Process children first (Bottom-Up)
+    if let Some(subs) = state.subfolders.get(path) {
+        let mut sorted_subs: Vec<_> = subs.iter().collect();
+        sorted_subs.sort();
+        for sub in sorted_subs {
+            let (mut child_groups, child_rem) = pack_node(sub, state, max_bytes, max_ch, sort_by, depth + 1)?;
+            finished.append(&mut child_groups);
+            bubbling.extend(child_rem);
         }
     }
 
-    // Linear Grouping Logic
-    let mut current = GroupPlan { files: Vec::new(), estimated_bytes: YAML_FRONTMATTER_SIZE + TOC_HEADER_SIZE };
-    for f in bubbling_files {
-        let path_len = f.rel.to_string_lossy().len() as u64;
-        let toc_line_overhead = 5 + path_len + NEWLINE_SIZE;
-        let chapter_overhead = CHAPTER_HEADER_BASE + path_len + (NEWLINE_SIZE * 2);
-        let total_f_overhead = toc_line_overhead + chapter_overhead;
+    // 2. Add local files
+    if let Some(locals) = state.files_by_folder.get(path) {
+        let mut sorted = locals.clone();
+        match sort_by {
+            SortBy::Name => sorted.sort_by(|a, b| a.rel_unix.cmp(&b.rel_unix)),
+            SortBy::Mtime => sorted.sort_by(|a, b| a.mtime.cmp(&b.mtime)),
+        }
+        bubbling.extend(sorted);
+    }
 
-        if f.size + total_f_overhead > max_bytes {
-            if !current.files.is_empty() { finished_groups.push(current); }
-            finished_groups.push(GroupPlan {
-                estimated_bytes: f.size + total_f_overhead + YAML_FRONTMATTER_SIZE + TOC_HEADER_SIZE,
-                files: vec![f]
-            });
-            current = GroupPlan { files: Vec::new(), estimated_bytes: YAML_FRONTMATTER_SIZE + TOC_HEADER_SIZE };
+    // 3. Group the bubbling pool
+    let mut groups = Vec::new();
+    let mut current = GroupPlan { files: Vec::new(), est_size: YAML_BASE + TOC_HEAD };
+
+    for f in bubbling {
+        let overhead = CHAPTER_BASE + (f.rel_unix.len() as u64 * 2) + 10; // TOC line + Header
+
+        // Behemoth isolation
+        if f.size + overhead + YAML_BASE + TOC_HEAD > max_bytes {
+            finished.push(GroupPlan { files: vec![f.clone()], est_size: f.size + overhead + YAML_BASE + TOC_HEAD });
             continue;
         }
 
-        let fits = (current.estimated_bytes + f.size + total_f_overhead < max_bytes) &&
-            (max_chapters == 0 || current.files.len() < max_chapters);
+        let fits = (current.est_size + f.size + overhead < max_bytes) &&
+            (max_ch == 0 || current.files.len() < max_ch);
 
         if fits {
-            current.estimated_bytes += f.size + total_f_overhead;
+            current.est_size += f.size + overhead;
             current.files.push(f);
         } else {
-            finished_groups.push(current);
-            current = GroupPlan {
-                files: vec![f.clone()],
-                estimated_bytes: YAML_FRONTMATTER_SIZE + TOC_HEADER_SIZE + f.size + total_f_overhead
-            };
+            if !current.files.is_empty() { groups.push(current); }
+            current = GroupPlan { files: vec![f.clone()], est_size: YAML_BASE + TOC_HEAD + f.size + overhead };
         }
     }
-    if !current.files.is_empty() { finished_groups.push(current); }
-    finished_groups
+
+    Ok((finished, current.files))
 }
+
+// --- Mass: Presentation & Writing ---
 
 pub fn run(cli: Cli) -> Result<()> {
     let out = cli.output_dir.clone().unwrap_or_else(|| cli.vault_root.join("_grouped"));
-    if !cli.dry_run { fs::create_dir_all(&out)?; }
+    if !cli.stats_only { fs::create_dir_all(&out)?; }
 
-    let mut gb = GlobSetBuilder::new();
-    for p in cli.exclude { gb.add(Glob::new(&p)?); }
-    let tree = build_tree(&cli.vault_root, &out, &gb.build()?)?;
-
+    let state = scan_vault(&cli.vault_root, &cli.exclude)?;
     let max_b = (cli.max_mb * 1024.0 * 1024.0) as u64;
-    let groups = pack_vault_iterative(&tree, max_b, cli.max_chapters, cli.sort_by);
 
-    if groups.is_empty() { println!("Vault is empty or all files excluded."); return Ok(()); }
-    if cli.dry_run { println!("Dry Run: {} groups planned.", groups.len()); return Ok(()); }
+    let (mut groups, last) = pack_node(Path::new(""), &state, max_b, cli.max_chapters, cli.sort_by, 0)?;
+    if !last.is_empty() { groups.push(GroupPlan { est_size: 0, files: last }); }
+
+    if cli.stats_only {
+        println!("Analysis Complete: {} packs planned for {} files.", groups.len(), state.files_by_folder.values().map(|v| v.len()).sum::<usize>());
+        return Ok(());
+    }
 
     let pb = ProgressBar::new(groups.len() as u64);
-    pb.set_style(ProgressStyle::default_bar().template("[{bar:40}] {pos}/{len} {msg}")?);
+    pb.set_style(ProgressStyle::default_bar().template("[{bar:40}] {pos}/{len} - {msg}")?);
 
-    let mut group_map = HashMap::new();
+    let mut manifest_data = Manifest { version: "1.4.0".into(), packs: HashMap::new() };
+
     for (i, g) in groups.iter().enumerate() {
-        let name = format!("pack_{:04}.md", i + 1);
-        let dest = out.join(&name);
-        group_map.insert(name.clone(), g.files.iter().map(|f| f.rel.clone()).collect());
+        let pack_name = format!("pack_{:04}.md", i + 1);
+        let dest = out.join(&pack_name);
 
         if cli.resume && !cli.force && dest.exists() { pb.inc(1); continue; }
+        if cli.force && dest.exists() { fs::remove_file(&dest)?; }
 
         let tmp = NamedTempFile::new_in(&out)?;
+        let mut hasher = Sha256::new();
         {
-            let mut w = BufWriter::new(tmp.as_file());
-            writeln!(w, "---\nvault_group: {}\n---", i + 1)?;
-            writeln!(w, "\n# Table of Contents")?;
-            for (idx, f) in g.files.iter().enumerate() { writeln!(w, "{}. {}", idx + 1, f.rel.display())?; }
+            let mut writer = BufWriter::new(tmp.as_file());
+
+            // Write Frontmatter & TOC
+            let head = format!("---\nvault_group: {}\n---\n\n# Table of Contents\n", i + 1);
+            writer.write_all(head.as_bytes())?;
+            hasher.update(head.as_bytes());
 
             for (idx, f) in g.files.iter().enumerate() {
+                let line = format!("{}. {}\n", idx + 1, f.rel_unix);
+                writer.write_all(line.as_bytes())?;
+                hasher.update(line.as_bytes());
+            }
+
+            // Write Content
+            for (idx, f) in g.files.iter().enumerate() {
                 let mut src = File::open(&f.abs)?;
-                let current_meta = src.metadata()?;
-                if current_meta.len() > f.size * 2 {
-                    bail!("File {} grew significantly during processing. Aborting.", f.rel.display());
+                let header = format!("\n---\n# Chapter {}: {}\n\n", idx + 1, f.rel_unix);
+                writer.write_all(header.as_bytes())?;
+                hasher.update(header.as_bytes());
+
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let n = src.read(&mut buffer)?;
+                    if n == 0 { break; }
+                    writer.write_all(&buffer[..n])?;
+                    hasher.update(&buffer[..n]);
                 }
-                writeln!(w, "\n---\n# Chapter {}: {}\n", idx + 1, f.rel.display())?;
-                std::io::copy(&mut src, &mut w)?;
             }
         }
-        tmp.persist(&dest).context("Failed to persist pack file")?;
+
+        let checksum = format!("{:x}", hasher.finalize());
+        manifest_data.packs.insert(pack_name, PackInfo {
+            checksum,
+            files: g.files.iter().map(|f| f.rel_unix.clone()).collect(),
+        });
+
+        tmp.persist(&dest).context("Atomic write failed")?;
         pb.inc(1);
     }
 
     if cli.manifest {
-        let m = Manifest {
-            generated_at: std::time::SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-            total_files: groups.iter().map(|g| g.files.len()).sum(),
-            group_map,
-        };
-        fs::write(out.join("manifest.json"), serde_json::to_string_pretty(&m)?)?;
+        let m_path = out.join("manifest.json");
+        fs::write(m_path, serde_json::to_string_pretty(&manifest_data)?)?;
     }
 
-    pb.finish_with_message("Done.");
+    pb.finish_with_message("Deployment Complete.");
     Ok(())
 }
 

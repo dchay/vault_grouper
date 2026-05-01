@@ -22,6 +22,7 @@ sha2         = "0.10"
 tempfile     = "3"
 time         = { version = "0.3", features = ["formatting", "macros"] }
 walkdir      = "2"
+ignore = "0.4.25"
 
 [dev-dependencies]
 proptest     = "1"
