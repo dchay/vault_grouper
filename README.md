@@ -1,3 +1,3 @@
-# obsidian_vault_grouper v0.1.9
+# code_grouper v2 based on obsidian_vault_grouper
 
 Markdown-only baseline package for RustRover.
