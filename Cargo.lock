@@ -581,7 +581,7 @@ checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 
 [[package]]
 name = "obsidian_vault_grouper"
-version = "1.6.9"
+version = "1.7.0"
 dependencies = [
  "anyhow",
  "atty",

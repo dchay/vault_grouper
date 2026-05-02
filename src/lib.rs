@@ -52,7 +52,7 @@ pub enum Commands {
     Pack {
         vault_root: PathBuf,
         output_dir: Option<PathBuf>,
-        #[arg(long, default_value_t = 20.0)]
+        #[arg(long, default_value_t = 10.0)]
         max_mb: f64,
         #[arg(long, default_value_t = 0)]
         max_chapters: usize,
