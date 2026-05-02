@@ -1,6 +1,6 @@
 [package]
 name    = "obsidian_vault_grouper"
-version = "0.1.9"
+version = "1.6.9"
 edition = "2024"
 
 [lib]

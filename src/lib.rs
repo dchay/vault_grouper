@@ -1,13 +1,13 @@
-//! # obsidian_vault_grouper v1.6.7
-//! **The Aegis Edition: Total Chronos.**
+//! # obsidian_vault_grouper v1.6.9
+//! **The Aegis Edition: Ordered Ledger.**
 //! 
-//! Unified sorting logic for files and folders.
-//! Deeply integrated with ECS Trio Hybrid workflows.[cite: 1]
+//! Critical Edge Case Fix: Manifest now lists all files in the global 
+//! sorted order defined by the --sort-by flag.[cite: 2]
 
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{BufWriter, Write},
+    io::{BufWriter, Write, BufReader, Read},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -16,7 +16,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use dunce;
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle};
 use jwalk::WalkDir;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -41,7 +41,7 @@ pub enum SortBy {
 }
 
 #[derive(Parser)]
-#[command(name = "grouper", version = "1.6.7")]
+#[command(name = "grouper", version = "1.6.9")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -92,7 +92,6 @@ pub struct MdFile {
 pub struct BrainState {
     pub files_by_folder: HashMap<PathBuf, Vec<Arc<MdFile>>>,
     pub subfolders: HashMap<PathBuf, HashSet<PathBuf>>,
-    /// Tracks the extreme mtime (min or max) for folders.
     pub folder_timestamps: HashMap<PathBuf, u64>,
 }
 
@@ -105,13 +104,17 @@ pub struct GroupPlan {
 #[derive(Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
+    pub sort_order: String,
+    /// Maps pack names to their checksums and metadata.
     pub packs: HashMap<String, PackInfo>,
+    /// The global ordered list of all files across all packs.
+    pub global_file_order: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PackInfo {
     pub checksum: String,
-    pub files: Vec<String>,
+    pub file_count: usize,
 }
 
 // --- Apparatus: Optimized Discovery ---
@@ -161,19 +164,15 @@ pub fn scan_vault(root: &Path, out: &Path, excludes: &GlobSet, sort_by: SortBy) 
             let meta = entry.metadata().context("Metadata error")?;
             let mtime = meta.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_secs();
 
-            // Trace up tree to establish folder timestamp hierarchy
             let mut curr = parent.as_path();
             loop {
                 let p_buf = curr.to_path_buf();
                 let timestamp = folder_timestamps.entry(p_buf.clone()).or_insert(mtime);
-                
-                // If Recent: Folder takes the MAX time. If Mtime (oldest): Folder takes the MIN time.
                 match sort_by {
                     SortBy::Recent => if mtime > *timestamp { *timestamp = mtime; },
                     SortBy::Mtime => if mtime < *timestamp { *timestamp = mtime; },
                     SortBy::Name => {} 
                 }
-
                 if let Some(up) = curr.parent() {
                     subfolders.entry(up.to_path_buf()).or_insert_with(HashSet::new).insert(p_buf);
                     curr = up;
@@ -275,23 +274,58 @@ pub fn run() -> Result<()> {
             if !dry_run { fs::create_dir_all(&out)?; }
 
             let excludes_set = build_globset(&exclude)?;
-            let state = scan_vault(&vault_root, &out, &excludes_set, sort_by)?; // Pass sort_by here
+            let state = scan_vault(&vault_root, &out, &excludes_set, sort_by)?; 
 
             let capacity = (max_mb * 1024.0 * 1024.0) as u64;
             let available = if capacity > SAFETY_MARGIN { capacity - SAFETY_MARGIN } else { capacity };
 
             let (mut packs, last) = pack_node(Path::new(""), &state, available, max_chapters, sort_by, 0)?;
-            if !last.is_empty() { packs.push(GroupPlan { files: last, est_size: 0 }); }
+            if !last.is_empty() { 
+                let last_size = last.iter().map(|f| f.size + PER_FILE_OVERHEAD).sum::<u64>() + YAML_BASE + TOC_HEAD;
+                packs.push(GroupPlan { files: last, est_size: last_size }); 
+            }
 
-            if packs.is_empty() || dry_run { return Ok(()); }
+            if packs.is_empty() { 
+                if !quiet { println!("No markdown files found to pack."); }
+                return Ok(()); 
+            }
 
-            let mut manifest_data = Manifest { version: "1.6.7".into(), packs: HashMap::new() };
-            let pack_pb = if !quiet && !no_progress { Some(ProgressBar::new(packs.len() as u64)) } else { None };
+            if dry_run {
+                println!("--- Dry Run: Plan for {} packs ---", packs.len());
+                for (i, p) in packs.iter().enumerate() {
+                    println!("Pack {:04}: {} files (~{:.2} MB)", i+1, p.files.len(), p.est_size as f64 / 1024.0 / 1024.0);
+                }
+                return Ok(());
+            }
+
+            let mut manifest_data = Manifest { 
+                version: "1.6.9".into(), 
+                sort_order: format!("{:?}", sort_by),
+                packs: HashMap::new(),
+                global_file_order: Vec::new(),
+            };
+
+            let pack_pb = if !quiet && !no_progress { 
+                let pb = ProgressBar::new(packs.len() as u64);
+                pb.set_style(ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")?
+                    .progress_chars("#>-"));
+                Some(pb)
+            } else { None };
 
             for (i, p) in packs.iter().enumerate() {
                 let pack_name = format!("pack_{:04}.md", i + 1);
+                
+                // Collect file paths into global order list for manifest[cite: 2]
+                for f in &p.files {
+                    manifest_data.global_file_order.push(f.rel_unix.clone());
+                }
+
                 let dest = out.join(&pack_name);
-                if dest.exists() && resume && !force { continue; }
+                if dest.exists() && resume && !force { 
+                    if let Some(ref pb) = pack_pb { pb.inc(1); }
+                    continue; 
+                }
 
                 let tmp = NamedTempFile::new_in(&out)?;
                 let mut hasher = Sha256::new();
@@ -311,29 +345,39 @@ pub fn run() -> Result<()> {
                         let chapter = format!("\n---\n# Chapter {}: {}\n\n", idx + 1, f.rel_unix);
                         writer.write_all(chapter.as_bytes())?;
                         hasher.update(chapter.as_bytes());
-                        let mut src = File::open(&f.abs)?;
-                        std::io::copy(&mut src, &mut writer)?;
-                        let mut src_hash = File::open(&f.abs)?;
-                        std::io::copy(&mut src_hash, &mut hasher)?;
+                        let mut src = BufReader::new(File::open(&f.abs)?);
+                        let mut buffer = [0u8; 8192];
+                        loop {
+                            let n = src.read(&mut buffer)?;
+                            if n == 0 { break; }
+                            writer.write_all(&buffer[..n])?;
+                            hasher.update(&buffer[..n]);
+                        }
                     }
+                    writer.flush()?;
                 }
 
                 manifest_data.packs.insert(pack_name, PackInfo {
                     checksum: format!("{:x}", hasher.finalize()),
-                    files: p.files.iter().map(|f| f.rel_unix.clone()).collect(),
+                    file_count: p.files.len(),
                 });
 
                 if dest.exists() {
                     let backup = dest.with_extension(format!("bak_{}", &Uuid::new_v4().simple().to_string()[..8]));
                     fs::rename(&dest, &backup)?;
                     tmp.persist(&dest)?;
-                    fs::remove_file(backup).ok();
+                    let _ = fs::remove_file(backup);
                 } else { tmp.persist(&dest)?; }
                 if let Some(ref pb) = pack_pb { pb.inc(1); }
             }
 
+            if let Some(pb) = pack_pb { pb.finish_with_message("Packing Complete"); }
+
             if manifest {
-                fs::write(out.join("vault_manifest.json"), serde_json::to_string_pretty(&manifest_data)?)?;
+                let manifest_path = out.join("vault_manifest.json");
+                let tmp_manifest = NamedTempFile::new_in(&out)?;
+                serde_json::to_writer_pretty(tmp_manifest.as_file(), &manifest_data)?;
+                tmp_manifest.persist(manifest_path)?;
             }
         }
         Commands::Verify { manifest_path, quiet } => {
@@ -344,7 +388,7 @@ pub fn run() -> Result<()> {
                 let p_path = base.join(name);
                 let mut hasher = Sha256::new();
                 if let Ok(mut f) = File::open(&p_path) {
-                    std::io::copy(&mut f, &mut hasher).ok();
+                    let _ = std::io::copy(&mut f, &mut hasher);
                     if format!("{:x}", hasher.finalize()) != info.checksum {
                         if !quiet { eprintln!("[FAIL] {}", name); }
                     } else if !quiet { println!("[OK] {}", name); }
