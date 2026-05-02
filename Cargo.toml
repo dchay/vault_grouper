@@ -1,32 +1,21 @@
 [package]
-name    = "obsidian_vault_grouper"
+name    = "code_grouper"
 version = "1.7.0"
 edition = "2024"
 
 [lib]
-name = "obsidian_vault_grouper"
+name = "code_grouper"
 path = "src/lib.rs"
 
 [[bin]]
-name = "obsidian_vault_grouper"
+name = "code_grouper"
 path = "src/main.rs"
 
 [dependencies]
 anyhow       = "1"
 clap         = { version = "4.5", features = ["derive"] }
-globset      = "0.4"
-indicatif    = "0.17"
-serde        = { version = "1", features = ["derive"] }
-serde_json   = "1"
-sha2         = "0.10"
 tempfile     = "3"
 walkdir      = "2"
-rayon = "1.12.0"
-chrono = "0.4.44"
-dunce = "1.0.5"
-atty = "0.2.14"
-uuid = { version = "1.23.1", features = ["v4"] }
-jwalk = "0.8.1"
 
 [dev-dependencies]
 tempfile     = "3"

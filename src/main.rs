@@ -1,4 +1,4 @@
-use obsidian_vault_grouper::{run};
+use code_grouper::{run};
 
 fn main() {
     if let Err(e) = run() {
