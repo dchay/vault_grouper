@@ -1,8 +1,8 @@
-//! # obsidian_vault_grouper v1.6.9
-//! **The Aegis Edition: Ordered Ledger.**
+//! # obsidian_vault_grouper v1.7.0
+//! **The Aegis Edition: Fully Indexed.**
 //! 
-//! Critical Edge Case Fix: Manifest now lists all files in the global 
-//! sorted order defined by the --sort-by flag.[cite: 2]
+//! Features: Direct file-to-pack mapping, global sorted ledger, 
+//! and production-hardened Windows 11 I/O.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -41,7 +41,7 @@ pub enum SortBy {
 }
 
 #[derive(Parser)]
-#[command(name = "grouper", version = "1.6.9")]
+#[command(name = "grouper", version = "1.7.0")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -105,9 +105,11 @@ pub struct GroupPlan {
 pub struct Manifest {
     pub version: String,
     pub sort_order: String,
-    /// Maps pack names to their checksums and metadata.
+    /// Detailed pack metadata.
     pub packs: HashMap<String, PackInfo>,
-    /// The global ordered list of all files across all packs.
+    /// Global registry: Maps "vault_path/file.md" -> "pack_0001.md"
+    pub file_to_pack_map: HashMap<String, String>,
+    /// Sorted list of all files across all packs.
     pub global_file_order: Vec<String>,
 }
 
@@ -282,7 +284,7 @@ pub fn run() -> Result<()> {
             let (mut packs, last) = pack_node(Path::new(""), &state, available, max_chapters, sort_by, 0)?;
             if !last.is_empty() { 
                 let last_size = last.iter().map(|f| f.size + PER_FILE_OVERHEAD).sum::<u64>() + YAML_BASE + TOC_HEAD;
-                packs.push(GroupPlan { files: last, est_size: last_size }); 
+                packs.push(GroupPlan { files: last, est_size: last_size });
             }
 
             if packs.is_empty() { 
@@ -291,7 +293,7 @@ pub fn run() -> Result<()> {
             }
 
             if dry_run {
-                println!("--- Dry Run: Plan for {} packs ---", packs.len());
+                println!("--- Dry Run: {} packs planned ---", packs.len());
                 for (i, p) in packs.iter().enumerate() {
                     println!("Pack {:04}: {} files (~{:.2} MB)", i+1, p.files.len(), p.est_size as f64 / 1024.0 / 1024.0);
                 }
@@ -299,9 +301,10 @@ pub fn run() -> Result<()> {
             }
 
             let mut manifest_data = Manifest { 
-                version: "1.6.9".into(), 
+                version: "1.7.0".into(), 
                 sort_order: format!("{:?}", sort_by),
                 packs: HashMap::new(),
+                file_to_pack_map: HashMap::new(),
                 global_file_order: Vec::new(),
             };
 
@@ -316,9 +319,10 @@ pub fn run() -> Result<()> {
             for (i, p) in packs.iter().enumerate() {
                 let pack_name = format!("pack_{:04}.md", i + 1);
                 
-                // Collect file paths into global order list for manifest[cite: 2]
+                // Track global order and reverse mapping
                 for f in &p.files {
                     manifest_data.global_file_order.push(f.rel_unix.clone());
+                    manifest_data.file_to_pack_map.insert(f.rel_unix.clone(), pack_name.clone());
                 }
 
                 let dest = out.join(&pack_name);
@@ -345,6 +349,7 @@ pub fn run() -> Result<()> {
                         let chapter = format!("\n---\n# Chapter {}: {}\n\n", idx + 1, f.rel_unix);
                         writer.write_all(chapter.as_bytes())?;
                         hasher.update(chapter.as_bytes());
+                        
                         let mut src = BufReader::new(File::open(&f.abs)?);
                         let mut buffer = [0u8; 8192];
                         loop {
