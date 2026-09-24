@@ -1,26 +1,21 @@
 [package]
-name         = "obsidian_vault_grouper"
-version      = "2.4.3"
-edition      = "2024"
-rust-version = "1.98"
-
-[lib]
 name = "obsidian_vault_grouper"
-path = "src/lib.rs"
-
-[[bin]]
-name = "obsidian_vault_grouper"
-path = "src/main.rs"
+version = "2.5.1"
+edition = "2024"
+rust-version = "1.98.0"
 
 [dependencies]
-anyhow    = "1.0.104"
-clap      = { version = "4.6.7", features = ["derive"] }
-dunce     = "1.0.5"
-globset   = "0.4.20"
+anyhow = "1.0.104"
+backoff = "0.4.0"
+clap = { version = "4.6.7", features = ["derive"] }
+dunce = "1.0.5"
+fs4 = "1.1.0"
+globset = "0.4.20"
 indicatif = "0.18.6"
-jiff      = "0.2.37"
-tempfile  = "3.27.0"
-walkdir   = "2.5.0"
+jiff = "0.2.37"
+phf = { version = "0.14", features = ["macros"] }
+tempfile = "3.27.0"
+walkdir = "2.5.0"
 
 [dev-dependencies]
-tempfile  = "3.27.0"
+proptest = "1.6.0"

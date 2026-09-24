@@ -1,165 +1,185 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use indicatif::{ProgressBar, ProgressStyle};
+use phf::phf_set;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tempfile::NamedTempFile;
 
-pub const PER_FILE_OVERHEAD: u64 = 512;
-pub const PACK_BASE_OVERHEAD: u64 = 256;
+pub const PER_FILE_OVERHEAD: u64 = 256;
+pub const PACK_BASE_OVERHEAD: u64 = 512;
 
-/// 1-byte, stack-allocated representation of supported language syntax highlighters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lang {
-    Markdown,
-    Rust,
-    Python,
-    JavaScript,
-    TypeScript,
-    C,
-    Cpp,
-    CSharp,
-    Go,
-    Java,
-    Json,
-    Yaml,
-    Toml,
-    Bash,
-    PowerShell,
-    Html,
-    Css,
-    Sql,
-    Unknown,
-}
+const SCAN_SPINNER_TEMPLATE: &str =
+    "{spinner:.green} [{elapsed_precise}] Scanning vault entries... ({pos} files matched)";
+const PACK_PROGRESS_TEMPLATE: &str =
+    "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} packs written";
 
-impl Lang {
-    pub fn from_extension(ext: &str) -> Self {
-        match ext.to_ascii_lowercase().as_str() {
-            "md" | "markdown" => Self::Markdown,
-            "rs" => Self::Rust,
-            "py" => Self::Python,
-            "js" | "mjs" | "cjs" => Self::JavaScript,
-            "ts" | "mts" | "cts" => Self::TypeScript,
-            "c" | "h" => Self::C,
-            "cpp" | "cxx" | "cc" | "hpp" | "hh" => Self::Cpp,
-            "cs" => Self::CSharp,
-            "go" => Self::Go,
-            "java" => Self::Java,
-            "json" => Self::Json,
-            "yaml" | "yml" => Self::Yaml,
-            "toml" => Self::Toml,
-            "sh" | "bash" => Self::Bash,
-            "ps1" | "psm1" => Self::PowerShell,
-            "html" | "htm" => Self::Html,
-            "css" => Self::Css,
-            "sql" => Self::Sql,
-            _ => Self::Unknown,
-        }
-    }
+pub static PACKABLE_EXTENSIONS: phf::Set<&'static str> = phf_set! {
+    "md", "markdown", "txt", "rs", "py", "js", "mjs", "cjs", "ts", "mts", "cts",
+    "c", "h", "cpp", "cxx", "cc", "hpp", "hh", "cs", "go", "java", "json",
+    "yaml", "yml", "toml", "sh", "bash", "ps1", "psm1", "html", "htm",
+    "css", "sql", "xml", "csv", "log", "rst", "adoc"
+};
 
-    pub fn is_code(&self) -> bool {
-        !matches!(self, Self::Markdown | Self::Unknown)
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Markdown => "markdown",
-            Self::Rust => "rust",
-            Self::Python => "python",
-            Self::JavaScript => "javascript",
-            Self::TypeScript => "typescript",
-            Self::C => "c",
-            Self::Cpp => "cpp",
-            Self::CSharp => "csharp",
-            Self::Go => "go",
-            Self::Java => "java",
-            Self::Json => "json",
-            Self::Yaml => "yaml",
-            Self::Toml => "toml",
-            Self::Bash => "bash",
-            Self::PowerShell => "powershell",
-            Self::Html => "html",
-            Self::Css => "css",
-            Self::Sql => "sql",
-            Self::Unknown => "text",
-        }
-    }
-}
-
-/// Data-Oriented representation of a vault file.
-#[derive(Debug, Clone)]
 pub struct MdFile {
     pub abs: PathBuf,
     pub rel_unix: String,
     pub size: u64,
     pub mtime: i64,
-    pub lang: Lang,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortBy {
-    Recent, // Descending mtime (newest first)
-    Oldest, // Ascending mtime
-    Path,   // Alphabetical rel_unix
-    Size,   // Descending size
+#[derive(Debug, Clone, Copy)]
+pub struct ManifestEntry {
+    pub file_idx: usize,
+    pub pack_num: usize,
 }
 
-pub fn sort_files(files: &mut [MdFile], sort_by: SortBy) {
-    match sort_by {
-        SortBy::Recent => {
-            files.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.rel_unix.cmp(&b.rel_unix)));
-        }
-        SortBy::Oldest => {
-            files.sort_by(|a, b| a.mtime.cmp(&b.mtime).then_with(|| a.rel_unix.cmp(&b.rel_unix)));
-        }
-        SortBy::Path => {
-            files.sort_by(|a, b| a.rel_unix.cmp(&b.rel_unix));
-        }
-        SortBy::Size => {
-            files.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.rel_unix.cmp(&b.rel_unix)));
+#[derive(Debug)]
+pub struct PackPlan {
+    pub boundaries: Vec<(usize, usize)>,
+}
+
+pub struct PackOptions<'a> {
+    pub vault_name: &'a str,
+    pub out_dir: &'a Path,
+    pub resume: bool,
+    pub write_manifest: bool,
+    pub available_bytes: u64,
+    pub quiet: bool,
+}
+
+#[inline]
+pub fn format_unix_timestamp(ts: i64) -> String {
+    jiff::Timestamp::from_second(ts)
+        .map(|t| t.strftime("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|_| "1970-01-01 00:00:00 UTC".to_string())
+}
+
+pub fn escape_md_cell(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '|' => out.push_str("\\|"),
+            '`' => out.push_str("\\`"),
+            '*' => out.push_str("\\*"),
+            '_' => out.push_str("\\_"),
+            '[' => out.push_str("\\["),             ']' => out.push_str("\\]"),
+            '\n' | '\r' => out.push(' '),
+            _ => out.push(c),
         }
     }
+    out
 }
 
-pub fn format_unix_timestamp(ts_secs: i64) -> String {
-    use jiff::Timestamp;
-    match Timestamp::from_second(ts_secs) {
-        Ok(ts) => ts.strftime("%Y-%m-%d %H:%M:%S UTC").to_string(),
-        Err(_) => "1970-01-01 00:00:00 UTC".to_string(),
+pub fn should_retry(err: &std::io::Error) -> bool {
+    matches!(err.kind(), std::io::ErrorKind::PermissionDenied)
+        || matches!(err.raw_os_error(), Some(32 | 33)) // 32: ERROR_SHARING_VIOLATION, 33: ERROR_LOCK_VIOLATION
+}
+
+pub fn persist_with_retry(temp: NamedTempFile, target: &Path) -> Result<()> {
+    let backoff = backoff::ExponentialBackoffBuilder::new()
+        .with_initial_interval(Duration::from_millis(5))
+        .with_max_interval(Duration::from_millis(100))
+        .with_max_elapsed_time(Some(Duration::from_secs(3)))
+        .build();
+
+    let mut temp_opt = Some(temp);
+
+    let op = || {
+        let temp_file = temp_opt
+            .take()
+            .expect("temp_opt must be present for retry attempt");
+
+        match temp_file.persist(target) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                temp_opt = Some(e.file);
+                if should_retry(&e.error) {
+                    Err(backoff::Error::transient(e.error))
+                } else {
+                    Err(backoff::Error::permanent(e.error))
+                }
+            }
+        }
+    };
+
+    backoff::retry(backoff, op)
+        .map_err(|e| anyhow::anyhow!("Failed to persist '{}': {}", target.display(), e))?;
+
+    Ok(())
+}
+
+pub fn build_glob_set(patterns: &[String]) -> Result<Option<GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
     }
+    let mut builder = GlobSetBuilder::new();
+    for p in patterns {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            let glob = Glob::new(trimmed)
+                .with_context(|| format!("Invalid glob pattern: '{trimmed}'"))?;
+            builder.add(glob);
+        }
+    }
+    Ok(Some(builder.build()?))
 }
 
 pub fn scan_vault_flat(
-    root: &Path,
-    out_dir: &Path,
-    glob_patterns: &[String],
+    vault_root: &Path,
+    exclude_globs: Option<&GlobSet>,
+    include_hidden: bool,
+    quiet: bool,
 ) -> Result<Vec<MdFile>> {
-    let root_canonical = dunce::canonicalize(root)
-        .with_context(|| format!("Failed to canonicalize vault root: {}", root.display()))?;
+    let root_canonical = dunce::canonicalize(vault_root)
+        .with_context(|| format!("Failed to resolve vault root: {}", vault_root.display()))?;
 
-    let out_abs = if out_dir.is_absolute() {
-        out_dir.to_path_buf()
+    let pb = if !quiet {
+        let p = ProgressBar::new_spinner();
+        p.set_style(
+            ProgressStyle::default_spinner()
+                .template(SCAN_SPINNER_TEMPLATE)
+                .with_context(|| format!("Invalid spinner template: '{SCAN_SPINNER_TEMPLATE}'"))?,
+        );
+        p.enable_steady_tick(Duration::from_millis(100));
+        Some(p)
     } else {
-        root_canonical.join(out_dir)
+        None
     };
-    let out_canonical = dunce::canonicalize(&out_abs).ok();
 
-    let mut builder = globset::GlobSetBuilder::new();
-    for pat in glob_patterns {
-        let glob = globset::Glob::new(pat)
-            .with_context(|| format!("Invalid glob pattern: '{pat}'"))?;
-        builder.add(glob);
-    }
-    let glob_set = builder.build().context("Failed to build glob set")?;
+    let mut files = Vec::with_capacity(1024);
 
-    let mut files = Vec::new();
-    let walker = walkdir::WalkDir::new(&root_canonical).follow_links(false);
-
-    for entry in walker {
+    for entry in walkdir::WalkDir::new(&root_canonical)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            if include_hidden {
+                true
+            } else if let Some(name) = e.file_name().to_str() {
+                !name.starts_with('.')
+            } else {
+                true
+            }
+        })
+    {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("Warning: traversal error encountering entry: {e}");
+                if !quiet {
+                    let msg = e.to_string();
+                    if msg.contains("does not exist") || msg.contains("path too long") {
+                        eprintln!(
+                            "Warning: Cannot traverse path (likely exceeds Windows MAX_PATH): {}",
+                            e.path().map(|p| p.display().to_string()).unwrap_or_default()
+                        );
+                    } else {
+                        eprintln!("Warning: Skipping unreadable entry during scan: {e}");
+                    }
+                }
                 continue;
             }
         };
@@ -169,26 +189,29 @@ pub fn scan_vault_flat(
         }
 
         let path = entry.path();
+        let Some(ext_os) = path.extension() else { continue };
+        let Some(ext) = ext_os.to_str() else { continue };
+        let ext_lower = ext.to_lowercase();
 
-        if path.starts_with(&out_abs)
-            || out_canonical
-            .as_ref()
-            .is_some_and(|o| path.starts_with(o))
-        {
+        if !PACKABLE_EXTENSIONS.contains(ext_lower.as_str()) {
             continue;
         }
 
         let Ok(rel_path) = path.strip_prefix(&root_canonical) else {
             continue;
         };
-
         let rel_unix = rel_path.to_string_lossy().replace('\\', "/");
 
-        if glob_set.is_match(&rel_unix) {
+        if let Some(globs) = exclude_globs
+            && globs.is_match(&rel_unix)
+        {
             continue;
         }
 
         let Ok(metadata) = entry.metadata() else {
+            if !quiet {
+                eprintln!("Warning: Could not read metadata for '{}'", rel_unix);
+            }
             continue;
         };
 
@@ -200,403 +223,319 @@ pub fn scan_vault_flat(
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let lang = Lang::from_extension(ext);
-
         files.push(MdFile {
             abs: path.to_path_buf(),
             rel_unix,
             size,
             mtime,
-            lang,
         });
+
+        if let Some(ref p) = pb {
+            p.inc(1);
+        }
     }
+
+    if let Some(p) = pb {
+        p.finish_and_clear();
+    }
+
+    files.sort_by(|a, b| {
+        b.mtime
+            .cmp(&a.mtime)
+            .then_with(|| a.rel_unix.cmp(&b.rel_unix))
+    });
 
     Ok(files)
 }
 
-#[derive(Debug, Clone)]
-pub struct PackPlan {
-    pub boundaries: Vec<(usize, usize)>,
-}
-
-pub fn plan_packs(files: &[MdFile], available_bytes: u64) -> PackPlan {
+pub fn plan_packs(files: &[MdFile], available_bytes: u64, quiet: bool) -> PackPlan {
     let mut boundaries = Vec::new();
-    if files.is_empty() {
+    let n = files.len();
+    if n == 0 {
         return PackPlan { boundaries };
     }
 
     let mut start = 0;
-    let mut current_size: u64 = 0;
+    let mut current_size = PACK_BASE_OVERHEAD;
 
     for (i, f) in files.iter().enumerate() {
-        let effective = f.size.saturating_add(PER_FILE_OVERHEAD);
-        let single_file_total = PACK_BASE_OVERHEAD.saturating_add(effective);
+        let item_cost = f.size.saturating_add(PER_FILE_OVERHEAD);
 
-        if single_file_total > available_bytes {
-            eprintln!(
-                "Warning: File '{}' ({} bytes + {} overhead) exceeds capacity ({} bytes). Placed in dedicated pack.",
-                f.rel_unix, f.size, PER_FILE_OVERHEAD + PACK_BASE_OVERHEAD, available_bytes
-            );
-            if i > start {
+        if PACK_BASE_OVERHEAD.saturating_add(item_cost) > available_bytes {
+            if start < i {
                 boundaries.push((start, i));
             }
             boundaries.push((i, i + 1));
+            if !quiet {
+                eprintln!(
+                    "Warning: File '{}' ({} bytes total, including {} bytes overhead) exceeds capacity ({} bytes). Placed in dedicated pack.",
+                    f.rel_unix,
+                    f.size.saturating_add(PER_FILE_OVERHEAD).saturating_add(PACK_BASE_OVERHEAD),
+                    PER_FILE_OVERHEAD + PACK_BASE_OVERHEAD,
+                    available_bytes
+                );
+            }
             start = i + 1;
-            current_size = 0;
+            current_size = PACK_BASE_OVERHEAD;
             continue;
         }
 
-        let pack_total = PACK_BASE_OVERHEAD.saturating_add(current_size).saturating_add(effective);
-
-        if pack_total > available_bytes && current_size > 0 {
+        if current_size.saturating_add(item_cost) > available_bytes {
             boundaries.push((start, i));
             start = i;
-            current_size = effective;
+            current_size = PACK_BASE_OVERHEAD.saturating_add(item_cost);
         } else {
-            current_size = current_size.saturating_add(effective);
+            current_size = current_size.saturating_add(item_cost);
         }
     }
 
-    if start < files.len() {
-        boundaries.push((start, files.len()));
+    if start < n {
+        boundaries.push((start, n));
     }
 
     PackPlan { boundaries }
 }
 
-pub fn escape_md_cell(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '|' => out.push_str("\\|"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-pub fn unescape_md_cell(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('\\') => out.push('\\'),
-                Some('|') => out.push('|'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-pub fn split_unescaped_pipes(s: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut escaped = false;
-
-    for c in s.chars() {
-        if escaped {
-            current.push('\\');
-            current.push(c);
-            escaped = false;
-        } else if c == '\\' {
-            escaped = true;
-        } else if c == '|' {
-            parts.push(std::mem::take(&mut current));
-        } else {
-            current.push(c);
-        }
-    }
-    if escaped {
-        current.push('\\');
-    }
-    parts.push(current);
-    parts
-}
-
-pub fn read_existing_manifest_paths(manifest_path: &Path) -> HashSet<String> {
-    let mut packed = HashSet::new();
-    let file = match File::open(manifest_path) {
-        Ok(f) => f,
-        Err(_) => return packed,
-    };
-
-    let reader = BufReader::new(file);
-    for line in reader.lines().map_while(Result::ok) {
-        let line = line.trim();
-        if !line.starts_with('|') || line.starts_with("| Relative Path") || line.starts_with("|---") {
-            continue;
-        }
-
-        let parts = split_unescaped_pipes(line);
-        if parts.len() >= 4 {
-            let path = unescape_md_cell(parts[1].trim());
-            if !path.is_empty() {
-                packed.insert(path);
-            }
-        }
-    }
-    packed
-}
-
-pub fn find_highest_pack_index(out_dir: &Path, vault_name: &str) -> usize {
-    let prefix = format!("{vault_name}-pack_");
+pub fn find_highest_pack_index(out_dir: &Path, pack_prefix: &str) -> usize {
     let mut highest = 0;
-
     if let Ok(entries) = fs::read_dir(out_dir) {
-        for entry in entries.map_while(Result::ok) {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(rest) = name.strip_prefix(&prefix)
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && let Some(rest) = name.strip_prefix(pack_prefix)
                 && let Some(num_str) = rest.strip_suffix(".md")
                 && let Ok(num) = num_str.parse::<usize>()
-                && num > highest
             {
-                highest = num;
+                highest = highest.max(num);
             }
         }
     }
     highest
 }
 
-pub fn clean_existing_pack_outputs(
+pub fn read_already_packed_rel_paths(
     out_dir: &Path,
-    vault_name: &str,
-    manifest_name: &str,
-) -> Result<()> {
-    let pack_prefix = format!("{vault_name}-pack_");
-    let mut failures = Vec::new();
-
-    if let Ok(entries) = fs::read_dir(out_dir) {
-        for entry in entries.map_while(Result::ok) {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            if ((name.starts_with(&pack_prefix) && name.ends_with(".md")) || name == manifest_name)
-                && let Err(e) = fs::remove_file(&path)
-            {
-                failures.push((path, e));
-            }
-        }
+    pack_prefix: &str,
+) -> Result<HashSet<String>> {
+    let mut set = HashSet::new();
+    if !out_dir.exists() {
+        return Ok(set);
     }
 
-    if !failures.is_empty() {
-        for (path, e) in &failures {
-            eprintln!("Warning: could not remove '{}': {}", path.display(), e);
-        }
-        bail!(
-            "--force could not remove {} existing output file(s); close any applications locking them and retry.",
-            failures.len()
-        );
-    }
-
-    Ok(())
-}
-
-pub fn persist_with_retry(mut temp: NamedTempFile, target: &Path) -> Result<()> {
-    let mut last_err = None;
-    for attempt in 0..5 {
-        match temp.persist(target) {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                temp = e.file;
-                last_err = Some(e.error);
-                if attempt < 4 {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+    for entry in fs::read_dir(out_dir)?.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.starts_with(pack_prefix)
+            && name.ends_with(".md")
+            && let Ok(file) = File::open(&path)
+        {
+            let reader = BufReader::new(file);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Some(rest) = line.strip_prefix("<!-- File: ")
+                    && let Some(rel) = rest.split(" | ").next()
+                {
+                    set.insert(rel.to_string());
                 }
             }
         }
     }
-    Err(anyhow::anyhow!(
-        "Failed to persist '{}' after 5 attempts: {}. Ensure destination path is not locked by another process.",
-        target.display(),
-        last_err.unwrap()
-    ))
+    Ok(set)
 }
 
-pub struct PackOptions<'a> {
-    pub vault_name: &'a str,
-    pub out_dir: &'a Path,
-    pub resume: bool,
-    pub write_manifest: bool,
-    pub available_bytes: u64,
-}
+pub fn clean_existing_pack_outputs(
+    out_dir: &Path,
+    pack_prefix: &str,
+    manifest_name: &str,
+    quiet: bool,
+) -> Result<()> {
+    if !out_dir.exists() {
+        return Ok(());
+    }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ManifestEntry {
-    pub file_idx: usize,
-    pub pack_num: usize,
+    for entry in fs::read_dir(out_dir)?.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && ((name.starts_with(pack_prefix) && name.ends_with(".md")) || name == manifest_name)
+            && let Err(e) = fs::remove_file(&path)
+            && !quiet
+        {
+            eprintln!("Warning: Failed to clean output file '{}': {e}", path.display());
+        }
+    }
+    Ok(())
 }
 
 pub fn execute_pack_write(
     files: &[MdFile],
     plan: &PackPlan,
     opts: &PackOptions,
-) -> Result<()> {
+) -> Result<Vec<ManifestEntry>> {
     fs::create_dir_all(opts.out_dir)
-        .with_context(|| format!("Failed to create output directory: {}", opts.out_dir.display()))?;
+        .with_context(|| format!("Failed to create output dir: {}", opts.out_dir.display()))?;
 
-    let manifest_name = format!("{}-manifest.md", opts.vault_name);
-    let manifest_path = opts.out_dir.join(&manifest_name);
+    let lock_path = opts.out_dir.join(".vault_grouper.lock");
+    let lock_file = File::create(&lock_path)
+        .with_context(|| format!("Failed to create lock file at {}", lock_path.display()))?;
 
-    if opts.resume && !manifest_path.exists() {
-        bail!(
-            "--resume specified but no manifest found at '{}'. Run without --resume for a fresh pack, or use --force to purge existing outputs.",
-            manifest_path.display()
-        );
-    }
+    fs4::FileExt::lock(&lock_file)
+        .with_context(|| format!("Failed to acquire lock on {}", lock_path.display()))?;
 
-    let already_packed = if opts.resume {
-        read_existing_manifest_paths(&manifest_path)
-    } else {
-        HashSet::new()
-    };
+    debug_assert!(
+        plan.boundaries.iter().all(|&(s, e)| {
+            let est: u64 = files[s..e]
+                .iter()
+                .map(|f| f.size.saturating_add(PER_FILE_OVERHEAD))
+                .sum::<u64>()
+                .saturating_add(PACK_BASE_OVERHEAD);
+            est <= opts.available_bytes || (e - s) == 1
+        }),
+        "plan_packs produced an oversized pack; this is a bug in plan_packs"
+    );
 
-    let pack_start_idx = if opts.resume {
-        find_highest_pack_index(opts.out_dir, opts.vault_name) + 1
+    let pack_prefix = format!("{}_pack_", opts.vault_name);
+    let start_pack_num = if opts.resume {
+        find_highest_pack_index(opts.out_dir, &pack_prefix) + 1
     } else {
         1
     };
 
-    for &(start, end) in &plan.boundaries {
-        let est: u64 = files[start..end]
-            .iter()
-            .map(|f| f.size.saturating_add(PER_FILE_OVERHEAD))
-            .sum::<u64>()
-            .saturating_add(PACK_BASE_OVERHEAD);
-
-        if est > opts.available_bytes && (end - start) > 1 {
-            eprintln!(
-                "Warning: Pack slice [{}..{}] estimated at {} bytes exceeds target capacity of {} bytes.",
-                start, end, est, opts.available_bytes
-            );
-        }
-    }
-
-    let mut written_pack_num = pack_start_idx;
-    let mut manifest_entries = Vec::new();
-
     let generation_ts = jiff::Timestamp::now().as_second();
     let generation_str = format_unix_timestamp(generation_ts);
 
-    let pb = indicatif::ProgressBar::new(plan.boundaries.len() as u64);
-    const PROGRESS_TEMPLATE: &str = "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} packs ({msg})";
-    pb.set_style(
-        indicatif::ProgressStyle::default_bar()
-            .template(PROGRESS_TEMPLATE)
-            .with_context(|| format!("Failed to construct progress bar template: '{PROGRESS_TEMPLATE}'"))?
-            .progress_chars("#>-"),
-    );
+    let pb = if !opts.quiet {
+        let p = ProgressBar::new(plan.boundaries.len() as u64);
+        p.set_style(
+            ProgressStyle::default_bar()
+                .template(PACK_PROGRESS_TEMPLATE)
+                .with_context(|| format!("Invalid template: '{PACK_PROGRESS_TEMPLATE}'"))?,
+        );
+        Some(p)
+    } else {
+        None
+    };
 
-    for &(start, end) in &plan.boundaries {
-        let active_indices: Vec<usize> = (start..end)
-            .filter(|&idx| !already_packed.contains(&files[idx].rel_unix))
-            .collect();
+    let mut manifest_entries = Vec::with_capacity(files.len());
 
-        if active_indices.is_empty() {
-            pb.inc(1);
-            continue;
-        }
+    for (i, &(start, end)) in plan.boundaries.iter().enumerate() {
+        let current_pack_num = start_pack_num + i;
+        let pack_filename = format!("{pack_prefix}{current_pack_num:04}.md");
+        let pack_target_path = opts.out_dir.join(&pack_filename);
 
-        let pack_num = written_pack_num;
-        let pack_filename = format!("{}-pack_{:04}.md", opts.vault_name, pack_num);
-        let pack_path = opts.out_dir.join(&pack_filename);
-        pb.set_message(format!("pack {pack_num:04}"));
-
-        let temp_file = NamedTempFile::new_in(opts.out_dir)
-            .with_context(|| format!("Failed to create temporary pack file in {}", opts.out_dir.display()))?;
+        let parent_dir = pack_target_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        let mut temp_pack = NamedTempFile::new_in(parent_dir)
+            .with_context(|| format!("Failed to create temporary file in {}", parent_dir.display()))?;
 
         {
-            let mut writer = BufWriter::new(&temp_file);
+            let mut writer = BufWriter::new(&mut temp_pack);
+            writeln!(writer, "# Vault Pack: {}", opts.vault_name)?;
+            writeln!(writer, "<!-- Pack Number: {current_pack_num} -->")?;
+            writeln!(writer, "<!-- Generation Date: {generation_str} -->\n")?;
 
-            writeln!(writer, "# Pack {pack_num:04}: {}", opts.vault_name)?;
-            writeln!(writer, "<!-- Pack Generated: {generation_str} -->\n")?;
+            let mut read_buf = vec![0u8; 64 * 1024];
 
-            for &idx in &active_indices {
-                let f = &files[idx];
-                let formatted_mtime = format_unix_timestamp(f.mtime);
-
+            for (offset, file) in files[start..end].iter().enumerate() {
+                let idx = start + offset;
                 writeln!(
                     writer,
-                    "<!-- File: {} | Last Modified: {} | Size: {} bytes -->",
-                    f.rel_unix, formatted_mtime, f.size
+                    "<!-- File: {} | Last Modified: {} -->",
+                    file.rel_unix,
+                    format_unix_timestamp(file.mtime)
                 )?;
+                writeln!(writer, "## Path: {}\n", file.rel_unix)?;
 
-                if f.lang.is_code() {
-                    writeln!(writer, "```{}", f.lang.as_str())?;
-                    let mut src = File::open(&f.abs)
-                        .with_context(|| format!("Failed to open file: {}", f.abs.display()))?;
-                    std::io::copy(&mut src, &mut writer)?;
-                    writeln!(writer, "\n```\n")?;
-                } else {
-                    let mut src = File::open(&f.abs)
-                        .with_context(|| format!("Failed to open file: {}", f.abs.display()))?;
-                    std::io::copy(&mut src, &mut writer)?;
-                    writeln!(writer, "\n\n---\n")?;
+                match File::open(&file.abs) {
+                    Ok(f) => {
+                        let mut reader = BufReader::new(f);
+                        loop {
+                            let bytes_read = reader.read(&mut read_buf)?;
+                            if bytes_read == 0 {
+                                break;
+                            }
+                            writer.write_all(&read_buf[..bytes_read])?;
+                        }
+                    }
+                    Err(e) => {
+                        if !opts.quiet {
+                            eprintln!(
+                                "Warning: Unreadable file skipped during pack write '{}': {e}",
+                                file.rel_unix
+                            );
+                        }
+                        writeln!(writer, "*[File contents unreadable]*")?;
+                    }
                 }
 
-                if opts.write_manifest {
-                    manifest_entries.push(ManifestEntry {
-                        file_idx: idx,
-                        pack_num,
-                    });
-                }
+                writeln!(writer, "\n---\n")?;
+                manifest_entries.push(ManifestEntry {
+                    file_idx: idx,
+                    pack_num: current_pack_num,
+                });
             }
-
             writer.flush()?;
         }
 
-        persist_with_retry(temp_file, &pack_path)?;
+        persist_with_retry(temp_pack, &pack_target_path)?;
 
-        written_pack_num += 1;
-        pb.inc(1);
+        if let Some(ref p) = pb {
+            p.inc(1);
+        }
     }
 
-    pb.finish_with_message("Packs written successfully");
+    if let Some(p) = pb {
+        p.finish_and_clear();
+    }
 
     if opts.write_manifest && !manifest_entries.is_empty() {
-        let m_temp = NamedTempFile::new_in(opts.out_dir)
-            .with_context(|| format!("Failed to create temp manifest file in {}", opts.out_dir.display()))?;
+        let manifest_filename = format!("{}_manifest.md", opts.vault_name);
+        let manifest_target_path = opts.out_dir.join(&manifest_filename);
+
+        let parent_dir = manifest_target_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        let mut temp_manifest = NamedTempFile::new_in(parent_dir)?;
 
         {
-            let mut m_writer = BufWriter::new(&m_temp);
+            let mut m_writer = BufWriter::new(&mut temp_manifest);
 
-            let append_mode = opts.resume && manifest_path.exists();
-
-            if append_mode {
-                let mut existing = File::open(&manifest_path)
-                    .with_context(|| format!("Failed to open existing manifest for resume: {}", manifest_path.display()))?;
-                std::io::copy(&mut existing, &mut m_writer)?;
+            if opts.resume && manifest_target_path.exists() {
+                if let Ok(mut existing) = File::open(&manifest_target_path) {
+                    std::io::copy(&mut existing, &mut m_writer)?;
+                    writeln!(m_writer)?;
+                }
             } else {
-                writeln!(m_writer, "# Vault Manifest: {}\n", opts.vault_name)?;
+                writeln!(m_writer, "# Manifest for {}", opts.vault_name)?;
+                writeln!(m_writer, "<!-- Generation Date: {generation_str} -->\n")?;
                 writeln!(
                     m_writer,
-                    "<!-- Manifest Generated: {generation_str} -->\n"
+                    "| Relative Path | Pack File | Last Modified | Size (bytes) |"
                 )?;
-                writeln!(m_writer, "| Relative Path | Pack File | Last Modified |")?;
-                writeln!(m_writer, "|---|---|---|")?;
+                writeln!(
+                    m_writer,
+                    "| :--- | :--- | :--- | :--- |"
+                )?;
             }
 
-            for entry in manifest_entries {
-                let f = &files[entry.file_idx];
-                let escaped_path = escape_md_cell(&f.rel_unix);
-                let pack_filename = format!("{}-pack_{:04}.md", opts.vault_name, entry.pack_num);
-                let mtime_str = format_unix_timestamp(f.mtime);
-                writeln!(m_writer, "| {escaped_path} | {pack_filename} | {mtime_str} |")?;
+            for entry in &manifest_entries {
+                let file = &files[entry.file_idx];
+                let pack_filename = format!("{pack_prefix}{:04}.md", entry.pack_num);
+                writeln!(
+                    m_writer,
+                    "| {} | {} | {} | {} |",
+                    escape_md_cell(&file.rel_unix),
+                    escape_md_cell(&pack_filename),
+                    format_unix_timestamp(file.mtime),
+                    file.size
+                )?;
             }
-
             m_writer.flush()?;
         }
 
-        persist_with_retry(m_temp, &manifest_path)?;
+        persist_with_retry(temp_manifest, &manifest_target_path)?;
     }
 
-    Ok(())
+    Ok(manifest_entries)
 }

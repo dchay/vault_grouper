@@ -1,181 +1,172 @@
-use anyhow::{bail, Context, Result};
-use clap::{ArgAction, Parser};
+use anyhow::{Context, Result};
+use clap::Parser;
 use std::path::PathBuf;
 
 use obsidian_vault_grouper::{
-    clean_existing_pack_outputs, execute_pack_write, plan_packs, scan_vault_flat, sort_files,
-    PackOptions, SortBy,
+    build_glob_set, clean_existing_pack_outputs, execute_pack_write, plan_packs,
+    read_already_packed_rel_paths, scan_vault_flat, PackOptions,
 };
 
 #[derive(Parser, Debug)]
 #[command(
     name = "obsidian_vault_grouper",
-    version = "2.4.3",
-    about = "Data-oriented Vault Pack Grouper for Obsidian Vaults"
+    version = "2.5.1",
+    about = "Data-Oriented Obsidian Vault Pack Grouper with Windows 11 retry persistence and chronological packing."
 )]
 struct Args {
-    /// Target vault directory path
-    #[arg(short, long)]
+    #[arg(short = 'i', long, help = "Path to input Obsidian vault root")]
     vault: PathBuf,
 
-    /// Output directory for packs and manifest
-    #[arg(short, long)]
-    out: PathBuf,
+    #[arg(short = 'o', long, help = "Output directory for packs and manifest")]
+    out_dir: PathBuf,
 
-    /// Maximum pack size in Megabytes (MB)
-    #[arg(short, long, default_value_t = 25)]
-    max_mb: u64,
+    #[arg(
+        short = 'n',
+        long,
+        default_value = "vault",
+        help = "Prefix name for output packs"
+    )]
+    name: String,
 
-    /// Safety margin percentage subtracted from target capacity (0 to 50%)
-    #[arg(long, default_value_t = 5.0)]
-    safety_margin: f64,
+    #[arg(
+        short = 's',
+        long,
+        default_value_t = 1048576,
+        help = "Target pack size in bytes (default 1 MB)"
+    )]
+    pack_size: u64,
 
-    /// Force clean existing pack files in output directory before execution
-    #[arg(long, action = ArgAction::SetTrue)]
-    force: bool,
+    #[arg(
+        short = 'e',
+        long = "exclude",
+        help = "Glob patterns to exclude (can be repeated)"
+    )]
+    excludes: Vec<String>,
 
-    /// Resume packing by skipping files already listed in existing manifest
-    #[arg(long, action = ArgAction::SetTrue)]
+    #[arg(long, help = "Include hidden files and dot-directories (e.g., .obsidian)")]
+    include_hidden: bool,
+
+    #[arg(long, help = "Resume packing without overwriting existing pack files")]
     resume: bool,
 
-    /// Explicitly disable manifest generation (manifest is enabled by default)
-    #[arg(long, action = ArgAction::SetTrue)]
-    no_manifest: bool,
+    #[arg(
+        short = 'm',
+        long = "manifest",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        help = "Generate manifest.md table (default: true)"
+    )]
+    manifest: bool,
 
-    /// Glob exclude patterns (can be specified multiple times)
-    #[arg(short, long)]
-    exclude: Vec<String>,
-
-    /// Sort files prior to packing [options: recent, oldest, path, size]
-    #[arg(long, default_value = "recent")]
-    sort: String,
-
-    /// Perform a dry run without writing pack files to disk
-    #[arg(long, action = ArgAction::SetTrue)]
+    #[arg(long, help = "Simulate plan without writing output files")]
     dry_run: bool,
+
+    #[arg(short = 'q', long, help = "Suppress progress spinners and warnings")]
+    quiet: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if !args.vault.exists() || !args.vault.is_dir() {
-        bail!("Vault directory does not exist or is not a directory: {}", args.vault.display());
+    if !args.quiet {
+        println!("Scanning vault: {}", args.vault.display());
     }
 
-    if args.max_mb == 0 {
-        bail!("--max-mb must be greater than zero.");
+    let exclude_globs = build_glob_set(&args.excludes)?;
+    let mut files = scan_vault_flat(
+        &args.vault,
+        exclude_globs.as_ref(),
+        args.include_hidden,
+        args.quiet,
+    )?;
+
+    if files.is_empty() {
+        if !args.quiet {
+            println!("No packable files found in target vault.");
+        }
+        return Ok(());
     }
 
-    if !(0.0..=50.0).contains(&args.safety_margin) {
-        bail!(
-            "--safety-margin must be between 0 and 50 percent; got {}",
-            args.safety_margin
+    let manifest_name = format!("{}_manifest.md", args.name);
+    let pack_prefix = format!("{}_pack_", args.name);
+
+    if args.resume {
+        let already_packed = read_already_packed_rel_paths(&args.out_dir, &pack_prefix)?;
+        if !already_packed.is_empty() {
+            let before_count = files.len();
+            files.retain(|f| !already_packed.contains(&f.rel_unix));
+            if !args.quiet {
+                println!(
+                    "Resuming run: skipped {} already-packed files. {} active files remaining.",
+                    before_count - files.len(),
+                    files.len()
+                );
+            }
+        } else if !args.quiet {
+            println!("--resume specified, but no existing manifest or packs were found. Proceeding with full scan.");
+        }
+
+        if files.is_empty() {
+            if !args.quiet {
+                println!("All files in vault are already packed. Nothing to do.");
+            }
+            return Ok(());
+        }
+    } else if !args.dry_run {
+        clean_existing_pack_outputs(&args.out_dir, &pack_prefix, &manifest_name, args.quiet)
+            .context("Failed to clean prior pack outputs")?;
+    }
+
+    if !args.quiet {
+        println!(
+            "Found {} active files sorted by last modified timestamp (descending). Planning packs (target <= {} bytes)...",
+            files.len(),
+            args.pack_size
         );
     }
 
-    let raw_name = args
-        .vault
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("vault");
-
-    let sanitized_name: String = raw_name
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-
-    let vault_name = if sanitized_name.is_empty() {
-        "vault".to_string()
-    } else {
-        sanitized_name
-    };
-
-    let write_manifest = !args.no_manifest;
-
-    if args.force && args.resume {
-        bail!("Cannot specify both --force and --resume. Choose one strategy.");
-    }
-
-    if args.force && !args.dry_run {
-        let manifest_name = format!("{vault_name}-manifest.md");
-        clean_existing_pack_outputs(&args.out, &vault_name, &manifest_name)?;
-    }
-
-    let sort_by = match args.sort.to_lowercase().as_str() {
-        "recent" => SortBy::Recent,
-        "oldest" => SortBy::Oldest,
-        "path" => SortBy::Path,
-        "size" => SortBy::Size,
-        other => bail!("Invalid sort option '{other}'. Valid options: recent, oldest, path, size."),
-    };
-
-    println!("Scanning vault flat at '{}'...", args.vault.display());
-    let mut files = scan_vault_flat(&args.vault, &args.out, &args.exclude)
-        .context("Failed during vault scanning")?;
-
-    if files.is_empty() {
-        println!("No matching files found in vault.");
-        return Ok(());
-    }
-
-    println!("Scanned {} files. Sorting by '{:?}'...", files.len(), sort_by);
-    sort_files(&mut files, sort_by);
-
-    let max_bytes = args
-        .max_mb
-        .checked_mul(1024 * 1024)
-        .ok_or_else(|| anyhow::anyhow!("--max-mb {} overflows byte capacity", args.max_mb))?;
-
-    let margin_bytes = ((max_bytes as f64) * (args.safety_margin / 100.0)) as u64;
-    let available_bytes = max_bytes.saturating_sub(margin_bytes);
-
-    if available_bytes == 0 {
-        bail!("Safety margin resulted in 0 available pack bytes. Lower safety margin or increase --max-mb.");
-    }
-
-    println!(
-        "Planning packs: target max {} MB ({} bytes available after {}% safety margin)...",
-        args.max_mb, available_bytes, args.safety_margin
-    );
-    let plan = plan_packs(&files, available_bytes);
+    let plan = plan_packs(&files, args.pack_size, args.quiet);
 
     if args.dry_run {
-        println!("\n=== Dry Run Plan Summary ===");
-        println!("Vault Name:         {vault_name}");
-        println!("Total Files:        {}", files.len());
-        println!("Planned Packs:      {}", plan.boundaries.len());
-        println!("Available Capacity: {available_bytes} bytes per pack");
-        for (idx, &(s, e)) in plan.boundaries.iter().enumerate() {
-            let slice = &files[s..e];
-            let size_sum: u64 = slice.iter().map(|f| f.size).sum();
+        println!("\n--- Dry Run Execution Summary ---");
+        println!("Total active packable files: {}", files.len());
+        println!("Generated packs count: {}", plan.boundaries.len());
+        for (i, &(start, end)) in plan.boundaries.iter().enumerate() {
+            let slice = &files[start..end];
+            let raw_size: u64 = slice.iter().map(|f| f.size).sum();
+            let newest = slice.first().map(|f| f.mtime).unwrap_or(0);
+            let oldest = slice.last().map(|f| f.mtime).unwrap_or(0);
+
             println!(
-                " Pack {:04}: {} files, ~{} bytes total ('{}' to '{}')",
-                idx + 1,
-                slice.len(),
-                size_sum,
-                slice.first().map(|f| f.rel_unix.as_str()).unwrap_or(""),
-                slice.last().map(|f| f.rel_unix.as_str()).unwrap_or("")
+                "  Pack {:04}: {} files, {} raw content bytes, mtime span [{} to {}]",
+                i + 1,
+                end - start,
+                raw_size,
+                obsidian_vault_grouper::format_unix_timestamp(oldest),
+                obsidian_vault_grouper::format_unix_timestamp(newest)
             );
         }
-        println!("Dry run complete. No files written.\n");
         return Ok(());
     }
 
-    println!(
-        "Writing {} planned pack(s) to '{}'...",
-        plan.boundaries.len(),
-        args.out.display()
-    );
-    let pack_opts = PackOptions {
-        vault_name: &vault_name,
-        out_dir: &args.out,
+    let opts = PackOptions {
+        vault_name: &args.name,
+        out_dir: &args.out_dir,
         resume: args.resume,
-        write_manifest,
-        available_bytes,
+        write_manifest: args.manifest,
+        available_bytes: args.pack_size,
+        quiet: args.quiet,
     };
 
-    execute_pack_write(&files, &plan, &pack_opts)?;
+    let manifest_entries = execute_pack_write(&files, &plan, &opts)?;
 
-    println!("Vault grouping completed successfully.");
+    if !args.quiet {
+        println!(
+            "Successfully packaged {} files into output directory: {}",
+            manifest_entries.len(),
+            args.out_dir.display()
+        );
+    }
+
     Ok(())
 }
