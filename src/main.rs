@@ -31,10 +31,10 @@ struct Args {
     #[arg(
         short = 's',
         long,
-        default_value_t = 1048576,
-        help = "Target pack size in bytes (default 1 MB)"
+        default_value_t = 1.0,
+        help = "Target pack size in megabytes (accepts decimals, e.g., 0.5, 12.5; default 1.0 MB)"
     )]
-    pack_size: u64,
+    pack_size: f64,
 
     #[arg(
         short = 'e',
@@ -67,6 +67,13 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.pack_size <= 0.0 || !args.pack_size.is_finite() {
+        anyhow::bail!("--pack-size (-s) must be a positive decimal number (e.g., 1.0, 12.5)");
+    }
+
+    // Convert decimal megabytes (1 MiB = 1,048,576 bytes) to u64 bytes
+    let pack_size_bytes = (args.pack_size * 1024.0 * 1024.0) as u64;
 
     if !args.quiet {
         println!("Scanning vault: {}", args.vault.display());
@@ -119,13 +126,14 @@ fn main() -> Result<()> {
 
     if !args.quiet {
         println!(
-            "Found {} active files sorted by last modified timestamp (descending). Planning packs (target <= {} bytes)...",
+            "Found {} active files sorted by last modified timestamp (descending). Planning packs (target <= {} bytes / {:.2} MB)...",
             files.len(),
+            pack_size_bytes,
             args.pack_size
         );
     }
 
-    let plan = plan_packs(&files, args.pack_size, args.quiet);
+    let plan = plan_packs(&files, pack_size_bytes, args.quiet);
 
     if args.dry_run {
         println!("\n--- Dry Run Execution Summary ---");
@@ -154,7 +162,7 @@ fn main() -> Result<()> {
         out_dir: &args.out_dir,
         resume: args.resume,
         write_manifest: args.manifest,
-        available_bytes: args.pack_size,
+        available_bytes: pack_size_bytes,
         quiet: args.quiet,
     };
 
